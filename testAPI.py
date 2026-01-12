@@ -2,7 +2,7 @@ from openai import OpenAI
 
 client = OpenAI(
 base_url='https://aigc.efunds.com.cn/v1',
-api_key='sk-RQir7DACSOuWlgzd2722A716945a473b82316c1d3e69B047',
+api_key='',
 )
 
 # # test basic llm api
