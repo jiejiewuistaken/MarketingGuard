@@ -363,14 +363,15 @@ def call_openai_json(
         },
     }
 
-    if hasattr(client, "responses") and hasattr(client.responses, "parse"):
-        response = client.responses.parse(
+        
+    if hasattr(client.chat.completions, "parse"):
+        
+        response = client.chat.completions.parse(
             model=model,
-            input=response_input,
+            messages=chat_messages,
             response_format=response_model,
-            extra_headers=extra_headers,
         )
-        return response.output_parsed
+        return model_validate_json_safe(response_model, response.choices[0].message.content)
 
     response = client.chat.completions.create(
         model=model,

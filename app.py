@@ -22,6 +22,8 @@ from audit_core import (
     parse_rules,
     run_audit,
 )
+from dotenv import load_dotenv
+load_dotenv()
 
 
 st.set_page_config(page_title="MarketingGuard", layout="wide")
