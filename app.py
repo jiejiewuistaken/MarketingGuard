@@ -194,7 +194,10 @@ if "audit_results" in st.session_state and image_files:
     results = st.session_state["audit_results"]
     ocr_map = st.session_state.get("ocr_map", {})
     poster_names = [file.name for file in image_files]
-    selected_index = st.slider("Poster index", 0, len(poster_names) - 1, 0)
+    if len(poster_names) > 1:
+        selected_index = st.slider("Poster index", 0, len(poster_names) - 1, 0)
+    else:
+        selected_index = 0
     selected_name = poster_names[selected_index]
 
     render_gallery(image_files, selected_name)

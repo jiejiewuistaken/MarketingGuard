@@ -382,10 +382,10 @@ def call_openai_json(
 
     if hasattr(client, "responses") and hasattr(client.responses, "create"):
         try:
-            response = client.responses.create(
+            resp = client.chat.completions.create(
                 model=model,
-                input=response_input,
-                response_format=response_format,
+                messages=response_input,
+                response_format=ComplianceTable,
                 extra_headers=extra_headers,
             )
             payload = getattr(response, "output_text", "") or ""
