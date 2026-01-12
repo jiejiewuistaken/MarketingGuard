@@ -43,6 +43,23 @@ class AuditResult(BaseModel):
     violations: List[Violation] = Field(default_factory=list)
 
 
+class ComplianceRow(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    filename: str = Field(alias="文件名")
+    level1: str = Field(alias="一级分类")
+    level2: str = Field(alias="二级分类")
+    error_id: str = Field(alias="错误id")
+    error_description: str = Field(alias="错误描述")
+    rule_name: str = Field(alias="合规规则名称")
+
+
+class ComplianceTable(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    rows: List[ComplianceRow] = Field(default_factory=list, alias="结果列表")
+
+
 class AuditMetrics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -363,15 +380,49 @@ def call_openai_json(
         },
     }
 
-        
+    if hasattr(client, "responses") and hasattr(client.responses, "create"):
+        try:
+            response = client.responses.create(
+                model=model,
+                input=response_input,
+                response_format=response_format,
+                extra_headers=extra_headers,
+            )
+            payload = getattr(response, "output_text", "") or ""
+            if not payload and getattr(response, "output", None):
+                chunks: List[str] = []
+                for output in response.output:
+                    content = getattr(output, "content", None)
+                    if not content:
+                        continue
+                    for item in content:
+                        text = getattr(item, "text", None)
+                        if text:
+                            chunks.append(text)
+                payload = "\n".join(chunks)
+            if payload:
+                return model_validate_json_safe(response_model, payload)
+        except Exception:
+            pass
+
     if hasattr(client.chat.completions, "parse"):
-        
-        response = client.chat.completions.parse(
-            model=model,
-            messages=chat_messages,
-            response_format=response_model,
-        )
-        return model_validate_json_safe(response_model, response.choices[0].message.content)
+        try:
+            kwargs = {
+                "model": model,
+                "messages": chat_messages,
+                "response_format": response_model,
+            }
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
+            response = client.chat.completions.parse(**kwargs)
+            parsed = getattr(response.choices[0].message, "parsed", None)
+            if parsed is not None:
+                return parsed
+            payload = response.choices[0].message.content or ""
+            if payload:
+                return model_validate_json_safe(response_model, payload)
+        except Exception:
+            pass
 
     response = client.chat.completions.create(
         model=model,
