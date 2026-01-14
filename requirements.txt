@@ -3,3 +3,6 @@ pydantic
 streamlit
 pandas
 python-dotenv
+openpyxl
+paddleocr>=2.7.0.3
+paddlepaddle>=2.5.0

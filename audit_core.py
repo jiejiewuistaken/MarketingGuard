@@ -441,22 +441,19 @@ def build_audit_prompts(
     include_rules: bool,
 ) -> Tuple[str, str]:
     system_prompt = (
-        "You are a compliance auditor for fund marketing materials. "
-        "Use the provided rules to identify violations. "
-        "Output JSON that strictly matches the schema. "
-        "Keep evidence concise and directly quoted when possible."
+        "你是易方达基金营销材料的合规审查员。使用提供的规则来识别违规行为。输出的 JSON 必须严格符合指定的格式。保持证据简洁，并尽可能直接引用原文"
     )
-    rules_block = format_rules(rules) if include_rules else "No rules provided."
+    rules_block = format_rules(rules) if include_rules else "没有检查到规则"
     user_prompt = (
-        f"Poster name: {poster_name}\n\n"
+        f"营销材料名称: {poster_name}\n\n"
         f"OCR text:\n{ocr_text or '[EMPTY]'}\n\n"
-        f"Rules:\n{rules_block}\n\n"
-        "Task:\n"
-        "- List every violation found in the poster.\n"
+        f"规则:\n{rules_block}\n\n"
+        "任务:\n"
+        "- 列出营销材料中所有违反规则的部分。\n"
         "- Each violation must cite a rule_id and include evidence.\n"
-        "- If no violations, return an empty list and compliant=true.\n"
-        "- Provide an overall_confidence between 0 and 1.\n"
-        "- Use modality=text, image, or text+image.\n"
+        "- 如果没有检查到违反规则的地方，返回一个空列表，并且compliant=true.\n"
+        "- 提供一个0-1之间的总体置信度.\n"
+        "- modality=text, image, or text+image.\n"
     )
     return system_prompt, user_prompt
 

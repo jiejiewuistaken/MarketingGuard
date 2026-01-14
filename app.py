@@ -94,7 +94,7 @@ def render_confidence_bars(results: Dict[str, AuditResult]) -> None:
 
 
 st.title("MarketingGuard Audit Assistant")
-st.caption("Multimodal audit helper for fund marketing posters.")
+st.caption("Multimodal audit helper for efund marketing posters.")
 
 with st.sidebar:
     st.header("Config")
@@ -125,12 +125,12 @@ with st.sidebar:
     if rules_file is not None:
         rules_text = rules_file.getvalue().decode("utf-8", errors="ignore")
 
-st.header("Upload data")
+st.header("上传待审核海报和OCR文本")
 image_files = st.file_uploader(
-    "Upload posters (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True
+    "上传待审核海报 (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True
 )
 ocr_files = st.file_uploader(
-    "Upload OCR text (MD/TXT)", type=["md", "txt"], accept_multiple_files=True
+    "上传OCR文本 (MD/TXT)", type=["md", "txt"], accept_multiple_files=True
 )
 
 run_button = st.button("Run audit")
@@ -140,20 +140,21 @@ if run_button:
         st.error("Please upload at least one poster image.")
         st.stop()
 
+# 解析规则文本
     parsed_rules = parse_rules(rules_text)
     if not parsed_rules:
         st.error("Rules are empty. Provide at least one rule.")
         st.stop()
 
     extra_headers = parse_extra_headers(extra_headers_raw)
-
+# 初始化openai客户端
     client = None
     if strategy != "rule_only":
         if not api_key:
             st.error("OPENAI_API_KEY is required for LLM strategies.")
             st.stop()
         client = build_openai_client(api_key=api_key, base_url=base_url)
-
+# 构建规则索引（使用/不使用/advanced RAG）
     rule_index = None
     if use_rag or strategy == "llm_only":
         cache_path = os.path.join(cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json")
