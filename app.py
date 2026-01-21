@@ -1,367 +1,282 @@
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from __future__ import annotations
+
+import base64
+import hashlib
 import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+import streamlit as st
+
+from audit_core import (
+    AuditMetrics,
+    AuditResult,
+    EmbeddingProvider,
+    RuleIndex,
+    build_openai_client,
+    compute_metrics,
+    model_dump_safe,
+    parse_extra_headers,
+    parse_rules,
+    run_audit,
+)
 
 
-INDEX_HTML = """<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OCR Image Editor</title>
-    <style>
-      :root {
-        color-scheme: light;
-      }
-      body {
-        margin: 0;
-        font-family: Arial, Helvetica, sans-serif;
-        background: #f6f7fb;
-        color: #222;
-      }
-      header {
-        padding: 16px 20px;
-        font-size: 18px;
-        font-weight: 600;
-        background: #101828;
-        color: #fff;
-      }
-      .container {
-        display: grid;
-        grid-template-columns: 1.2fr 1fr;
-        gap: 16px;
-        padding: 16px;
-      }
-      .panel {
-        background: #fff;
-        border: 1px solid #e2e5eb;
-        border-radius: 10px;
-        padding: 16px;
-        box-shadow: 0 2px 10px rgba(16, 24, 40, 0.06);
-      }
-      label {
-        display: block;
-        font-size: 13px;
-        font-weight: 600;
-        margin-bottom: 8px;
-        color: #344054;
-      }
-      input[type="file"] {
-        margin-bottom: 12px;
-      }
-      .controls {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-bottom: 12px;
-      }
-      button {
-        border: none;
-        background: #2563eb;
-        color: #fff;
-        padding: 8px 14px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-weight: 600;
-      }
-      button:disabled {
-        background: #94a3b8;
-        cursor: not-allowed;
-      }
-      #status {
-        font-size: 12px;
-        color: #475467;
-        min-height: 18px;
-        margin-bottom: 12px;
-      }
-      #image-stage {
-        position: relative;
-        border: 1px dashed #c7cbd3;
-        border-radius: 8px;
-        background: #fbfbfc;
-        padding: 8px;
-        display: inline-block;
-        max-width: 100%;
-      }
-      #preview {
-        display: block;
-        max-width: 100%;
-        height: auto;
-        border-radius: 4px;
-      }
-      #overlay {
-        position: absolute;
-        left: 8px;
-        top: 8px;
-        pointer-events: none;
-      }
-      .ocr-box {
-        position: absolute;
-        border: 1px solid rgba(37, 99, 235, 0.5);
-        background: rgba(255, 255, 255, 0.65);
-        color: #111;
-        padding: 1px 3px;
-        overflow: hidden;
-        pointer-events: auto;
-        border-radius: 2px;
-        min-width: 10px;
-      }
-      .ocr-box:focus {
-        outline: 2px solid rgba(37, 99, 235, 0.9);
-        background: rgba(255, 255, 255, 0.9);
-      }
-      textarea {
-        width: 100%;
-        min-height: 420px;
-        resize: vertical;
-        border: 1px solid #d5d9e0;
-        border-radius: 8px;
-        padding: 10px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-          "Courier New", monospace;
-        font-size: 13px;
-      }
-      .hint {
-        font-size: 12px;
-        color: #667085;
-        margin-top: 8px;
-      }
-      .hidden {
-        display: none;
-      }
-      @media (max-width: 960px) {
-        .container {
-          grid-template-columns: 1fr;
-        }
-      }
-    </style>
-  </head>
-  <body>
-    <header>OCR Image Editor</header>
-    <div class="container">
-      <section class="panel">
-        <label for="file-input">Upload image (JPG or PNG)</label>
-        <input id="file-input" type="file" accept="image/png,image/jpeg" />
-        <div class="controls">
-          <button id="ocr-btn">Run OCR</button>
-          <button id="download-btn">Download edited image</button>
-        </div>
-        <div id="status"></div>
-        <div id="image-stage">
-          <img id="preview" alt="Preview" />
-          <div id="overlay"></div>
-        </div>
-        <div class="hint">
-          Tip: Click any blue box to edit its text. Download will redraw the edited
-          text over the original image.
-        </div>
-      </section>
-      <section class="panel">
-        <label for="ocr-text">OCR result</label>
-        <textarea id="ocr-text" placeholder="OCR output will appear here." readonly></textarea>
-      </section>
+st.set_page_config(page_title="MarketingGuard", layout="wide")
+
+
+def bytes_to_base64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode("utf-8")
+
+
+def load_ocr_texts(files: List) -> Dict[str, str]:
+    ocr_map: Dict[str, str] = {}
+    for file in files:
+        stem = Path(file.name).stem
+        text = file.getvalue().decode("utf-8", errors="ignore")
+        ocr_map[stem] = text
+    return ocr_map
+
+
+def load_ground_truth(file) -> Dict[str, List[str]]:
+    if file is None:
+        return {}
+    if file.name.lower().endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+    if "poster_name" not in df.columns or "rule_id" not in df.columns:
+        st.warning("Ground truth file must include poster_name and rule_id columns.")
+        return {}
+    mapping: Dict[str, List[str]] = {}
+    for _, row in df.iterrows():
+        poster_name = str(row["poster_name"]).strip()
+        rule_ids = str(row["rule_id"]).replace(";", ",")
+        rules = [item.strip() for item in rule_ids.split(",") if item.strip()]
+        mapping.setdefault(poster_name, []).extend(rules)
+    return mapping
+
+
+def render_gallery(image_files: List, selected_name: str) -> None:
+    items = []
+    for file in image_files:
+        image_bytes = file.getvalue()
+        encoded = bytes_to_base64(image_bytes)
+        border = "2px solid #2563eb" if file.name == selected_name else "1px solid #e2e8f0"
+        items.append(
+            f"""
+            <div style="flex: 0 0 auto; text-align: center;">
+                <img src="data:{file.type};base64,{encoded}"
+                     style="height: 120px; border-radius: 8px; border: {border};" />
+                <div style="font-size: 12px; margin-top: 4px; color: #475467;">
+                    {file.name}
+                </div>
+            </div>
+            """
+        )
+    html = f"""
+    <div style="display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px;">
+        {''.join(items)}
     </div>
-    <canvas id="download-canvas" class="hidden"></canvas>
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-    <script>
-      const fileInput = document.getElementById("file-input");
-      const preview = document.getElementById("preview");
-      const overlay = document.getElementById("overlay");
-      const ocrBtn = document.getElementById("ocr-btn");
-      const downloadBtn = document.getElementById("download-btn");
-      const statusEl = document.getElementById("status");
-      const ocrText = document.getElementById("ocr-text");
-      const downloadCanvas = document.getElementById("download-canvas");
-
-      const OCR_LANG = "eng+chi_sim";
-      let currentDataUrl = "";
-      let currentScale = 1;
-      let ocrBoxes = [];
-
-      fileInput.addEventListener("change", handleFileSelect);
-      ocrBtn.addEventListener("click", runOCR);
-      downloadBtn.addEventListener("click", downloadEditedImage);
-      window.addEventListener("resize", () => {
-        if (!currentDataUrl) return;
-        syncOverlay();
-        renderBoxes(ocrBoxes);
-      });
-
-      function handleFileSelect() {
-        const file = fileInput.files[0];
-        if (!file) return;
-        if (!["image/jpeg", "image/png"].includes(file.type)) {
-          setStatus("Please upload a JPG or PNG image.");
-          fileInput.value = "";
-          return;
-        }
-        const reader = new FileReader();
-        reader.onload = () => {
-          currentDataUrl = reader.result;
-          preview.onload = () => {
-            syncOverlay();
-            clearOCR();
-            setStatus("Image loaded. Click 'Run OCR' to start.");
-          };
-          preview.src = currentDataUrl;
-        };
-        reader.readAsDataURL(file);
-      }
-
-      function syncOverlay() {
-        if (!preview.naturalWidth || !preview.naturalHeight) return;
-        const displayWidth = preview.clientWidth;
-        const displayHeight = preview.clientHeight;
-        currentScale = displayWidth / preview.naturalWidth;
-        overlay.style.width = displayWidth + "px";
-        overlay.style.height = displayHeight + "px";
-      }
-
-      function clearOCR() {
-        overlay.innerHTML = "";
-        ocrText.value = "";
-        ocrBoxes = [];
-      }
-
-      function setStatus(text) {
-        statusEl.textContent = text;
-      }
-
-      async function runOCR() {
-        if (!currentDataUrl) {
-          setStatus("Please upload an image first.");
-          return;
-        }
-        ocrBtn.disabled = true;
-        setStatus("OCR running...");
-        clearOCR();
-        try {
-          const result = await Tesseract.recognize(currentDataUrl, OCR_LANG, {
-            logger: (message) => {
-              if (message.status && message.progress !== undefined) {
-                const percent = Math.round(message.progress * 100);
-                setStatus(`${message.status} (${percent}%)`);
-              }
-            },
-          });
-          const data = result.data || {};
-          ocrText.value = (data.text || "").trim();
-          const lines = data.lines && data.lines.length ? data.lines : data.words || [];
-          ocrBoxes = lines.filter((line) => line.text && line.text.trim());
-          if (ocrBoxes.length) {
-            renderBoxes(ocrBoxes);
-            setStatus(`OCR done. ${ocrBoxes.length} editable box(es).`);
-          } else {
-            setStatus("OCR done. No text detected.");
-          }
-        } catch (error) {
-          console.error(error);
-          setStatus("OCR failed. Please try another image.");
-        } finally {
-          ocrBtn.disabled = false;
-        }
-      }
-
-      function renderBoxes(lines) {
-        overlay.innerHTML = "";
-        const scale = currentScale || 1;
-        lines.forEach((line) => {
-          const box = line.bbox;
-          if (!box) return;
-          const width = Math.max(1, box.x1 - box.x0);
-          const height = Math.max(1, box.y1 - box.y0);
-          const el = document.createElement("div");
-          el.className = "ocr-box";
-          el.contentEditable = "true";
-          el.spellcheck = false;
-          el.dataset.x = box.x0;
-          el.dataset.y = box.y0;
-          el.dataset.w = width;
-          el.dataset.h = height;
-          el.style.left = box.x0 * scale + "px";
-          el.style.top = box.y0 * scale + "px";
-          el.style.width = width * scale + "px";
-          el.style.height = height * scale + "px";
-          el.style.fontSize = Math.max(10, height * scale * 0.8) + "px";
-          el.textContent = line.text;
-          overlay.appendChild(el);
-        });
-      }
-
-      function downloadEditedImage() {
-        if (!currentDataUrl || !preview.naturalWidth) {
-          setStatus("Please upload an image first.");
-          return;
-        }
-        const img = new Image();
-        img.onload = () => {
-          downloadCanvas.width = img.naturalWidth;
-          downloadCanvas.height = img.naturalHeight;
-          const ctx = downloadCanvas.getContext("2d");
-          ctx.drawImage(img, 0, 0);
-          const boxes = overlay.querySelectorAll(".ocr-box");
-          boxes.forEach((box) => {
-            const text = box.textContent.trim();
-            if (!text) return;
-            const x = parseFloat(box.dataset.x);
-            const y = parseFloat(box.dataset.y);
-            const w = parseFloat(box.dataset.w);
-            const h = parseFloat(box.dataset.h);
-            ctx.fillStyle = "#ffffff";
-            ctx.fillRect(x, y, w, h);
-            ctx.fillStyle = "#111111";
-            ctx.font = `${Math.max(10, h * 0.8)}px sans-serif`;
-            ctx.textBaseline = "top";
-            ctx.fillText(text, x, y);
-          });
-          downloadCanvas.toBlob((blob) => {
-            if (!blob) return;
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = "edited.png";
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-            URL.revokeObjectURL(url);
-          }, "image/png");
-        };
-        img.src = currentDataUrl;
-      }
-    </script>
-  </body>
-</html>
-"""
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 
-class RequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(INDEX_HTML.encode("utf-8"))
-            return
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"ok")
-            return
-        self.send_response(404)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Not Found")
-
-    def log_message(self, format, *args):
-        return
+def render_confidence_bars(results: Dict[str, AuditResult]) -> None:
+    st.markdown("**Poster confidence bars**")
+    for name, result in results.items():
+        st.caption(name)
+        st.progress(int(result.overall_confidence * 100))
 
 
-def run_server():
-    port = int(os.environ.get("PORT", "8000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), RequestHandler)
-    print(f"Serving on http://localhost:{port}")
-    server.serve_forever()
+st.title("MarketingGuard Audit Assistant")
+st.caption("Multimodal audit helper for fund marketing posters.")
 
+with st.sidebar:
+    st.header("Config")
+    api_key = st.text_input("OPENAI_API_KEY", value=os.getenv("OPENAI_API_KEY", ""), type="password")
+    base_url = st.text_input("OPENAI_BASE_URL", value=os.getenv("OPENAI_BASE_URL", ""))
+    extra_headers_raw = st.text_area(
+        "OPENAI_EXTRA_HEADERS (JSON)",
+        value=os.getenv("OPENAI_EXTRA_HEADERS", ""),
+        height=100,
+    )
+    vlm_model = st.text_input("VLM model", value=os.getenv("OPENAI_VLM_MODEL", "gpt-4o-mini"))
+    embedding_model = st.text_input(
+        "Embedding model", value=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    )
+    use_rag = st.checkbox("Use RAG (hybrid recall)", value=True)
+    strategy = st.selectbox("Strategy", ["rule_vlm", "rule_only", "llm_only"], index=0)
+    cache_dir = st.text_input("Rule index cache dir", value=".cache")
 
-if __name__ == "__main__":
-    run_server()
+    st.divider()
+    st.subheader("Rules")
+    rules_file = st.file_uploader("Upload rules (.txt/.md)", type=["txt", "md"])
+    rules_text = st.text_area(
+        "Or paste rules here",
+        value="Rule 1. Do not promise returns or guarantee principal.",
+        height=140,
+    )
+
+    if rules_file is not None:
+        rules_text = rules_file.getvalue().decode("utf-8", errors="ignore")
+
+st.header("Upload data")
+image_files = st.file_uploader(
+    "Upload posters (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True
+)
+ocr_files = st.file_uploader(
+    "Upload OCR text (MD/TXT)", type=["md", "txt"], accept_multiple_files=True
+)
+
+run_button = st.button("Run audit")
+
+if run_button:
+    if not image_files:
+        st.error("Please upload at least one poster image.")
+        st.stop()
+
+    parsed_rules = parse_rules(rules_text)
+    if not parsed_rules:
+        st.error("Rules are empty. Provide at least one rule.")
+        st.stop()
+
+    extra_headers = parse_extra_headers(extra_headers_raw)
+
+    client = None
+    if strategy != "rule_only":
+        if not api_key:
+            st.error("OPENAI_API_KEY is required for LLM strategies.")
+            st.stop()
+        client = build_openai_client(api_key=api_key, base_url=base_url)
+
+    rule_index = None
+    if use_rag or strategy == "llm_only":
+        cache_path = os.path.join(cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json")
+        embedder = EmbeddingProvider(client, embedding_model)
+        rule_index = RuleIndex(parsed_rules, embedder, cache_path=cache_path)
+        rule_index.build()
+
+    ocr_map = load_ocr_texts(ocr_files)
+
+    results: Dict[str, AuditResult] = {}
+    latency_map: Dict[str, float] = {}
+    for image_file in image_files:
+        poster_name = image_file.name
+        ocr_text = ocr_map.get(Path(poster_name).stem, "")
+        start = time.time()
+        result = run_audit(
+            poster_name=poster_name,
+            image_bytes=image_file.getvalue(),
+            image_mime=image_file.type,
+            ocr_text=ocr_text,
+            rules=parsed_rules,
+            client=client,
+            model=vlm_model,
+            extra_headers=extra_headers,
+            strategy=strategy,
+            use_rag=use_rag,
+            rule_index=rule_index,
+            query_hint=None,
+        )
+        latency_map[poster_name] = (time.time() - start) * 1000
+        results[poster_name] = result
+
+    st.session_state["audit_results"] = results
+    st.session_state["ocr_map"] = ocr_map
+    st.session_state["latency_map"] = latency_map
+
+if "audit_results" in st.session_state and image_files:
+    results = st.session_state["audit_results"]
+    ocr_map = st.session_state.get("ocr_map", {})
+    poster_names = [file.name for file in image_files]
+    selected_index = st.slider("Poster index", 0, len(poster_names) - 1, 0)
+    selected_name = poster_names[selected_index]
+
+    render_gallery(image_files, selected_name)
+
+    left_col, right_col = st.columns([1.35, 1])
+    with left_col:
+        st.subheader("Poster preview")
+        selected_file = next(file for file in image_files if file.name == selected_name)
+        st.image(selected_file.getvalue(), caption=selected_name, use_column_width=True)
+        if selected_name in results:
+            st.caption("Overall confidence")
+            st.progress(int(results[selected_name].overall_confidence * 100))
+
+    with right_col:
+        st.subheader("OCR text")
+        ocr_text = ocr_map.get(Path(selected_name).stem, "")
+        st.text_area("OCR output", value=ocr_text, height=240, key=f"ocr_{selected_name}")
+
+        st.subheader("Audit results")
+        result = results.get(selected_name)
+        if result is None or not result.violations:
+            st.info("No violations detected.")
+        else:
+            df = pd.DataFrame([model_dump_safe(v) for v in result.violations])
+            st.dataframe(df, use_container_width=True)
+
+    st.divider()
+    render_confidence_bars(results)
+
+    st.divider()
+    st.subheader("Comparison runner")
+    st.caption("Run baseline comparisons: rule-only, LLM-only, and rule+VLM.")
+    gt_file = st.file_uploader("Upload ground truth (CSV/XLSX)", type=["csv", "xlsx"])
+    confirm_run = st.checkbox("Confirm running comparison")
+    if st.button("Run comparison") and confirm_run:
+        if not api_key:
+            st.error("OPENAI_API_KEY is required for LLM comparisons.")
+            st.stop()
+        ground_truth = load_ground_truth(gt_file)
+        if not ground_truth:
+            st.warning("Ground truth missing or invalid. Metrics will be zero.")
+        comparison_rules = parse_rules(rules_text)
+        extra_headers = parse_extra_headers(extra_headers_raw)
+        comparison_client = build_openai_client(api_key=api_key, base_url=base_url)
+        comparison_index = rule_index
+        if comparison_index is None:
+            cache_path = os.path.join(
+                cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json"
+            )
+            embedder = EmbeddingProvider(comparison_client, embedding_model)
+            comparison_index = RuleIndex(comparison_rules, embedder, cache_path=cache_path)
+            comparison_index.build()
+
+        metrics: List[AuditMetrics] = []
+        for mode in ["rule_only", "llm_only", "rule_vlm"]:
+            start = time.time()
+            predictions: List[AuditResult] = []
+            for image_file in image_files:
+                poster_name = image_file.name
+                ocr_text = ocr_map.get(Path(poster_name).stem, "")
+                predictions.append(
+                    run_audit(
+                        poster_name=poster_name,
+                        image_bytes=image_file.getvalue(),
+                        image_mime=image_file.type,
+                        ocr_text=ocr_text,
+                        rules=comparison_rules,
+                        client=comparison_client if mode != "rule_only" else None,
+                        model=vlm_model,
+                        extra_headers=extra_headers,
+                        strategy=mode,
+                        use_rag=use_rag,
+                        rule_index=comparison_index,
+                        query_hint=None,
+                    )
+                )
+            latency_ms = (time.time() - start) * 1000
+            metrics.append(
+                compute_metrics(
+                    predictions=predictions,
+                    ground_truth=ground_truth,
+                    strategy=mode,
+                    latency_ms=latency_ms,
+                )
+            )
+        metrics_df = pd.DataFrame([model_dump_safe(m) for m in metrics])
+        st.dataframe(metrics_df, use_container_width=True)
