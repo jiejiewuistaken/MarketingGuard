@@ -330,6 +330,18 @@ def encode_image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{b64}"
 
 
+def extract_json_payload(text: str) -> str:
+    if not text:
+        return text
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return stripped
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return stripped
+
+
 def call_openai_json(
     client: OpenAI,
     model: str,
@@ -401,7 +413,7 @@ def call_openai_json(
                             chunks.append(text)
                 payload = "\n".join(chunks)
             if payload:
-                return model_validate_json_safe(response_model, payload)
+                return model_validate_json_safe(response_model, extract_json_payload(payload))
         except Exception:
             pass
 
@@ -421,18 +433,22 @@ def call_openai_json(
                 return parsed
             payload = response.choices[0].message.content or ""
             if payload:
-                return model_validate_json_safe(response_model, payload)
+                return model_validate_json_safe(response_model, extract_json_payload(payload))
         except Exception:
             pass
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=chat_messages,
-        response_format=response_format,
-        extra_headers=extra_headers,
-    )
+    response_kwargs = {"model": model, "messages": chat_messages}
+    if extra_headers:
+        response_kwargs["extra_headers"] = extra_headers
+    try:
+        response = client.chat.completions.create(
+            **response_kwargs,
+            response_format={"type": "json_object"},
+        )
+    except TypeError:
+        response = client.chat.completions.create(**response_kwargs)
     payload = response.choices[0].message.content
-    return model_validate_json_safe(response_model, payload)
+    return model_validate_json_safe(response_model, extract_json_payload(payload))
 
 
 def build_audit_prompts(
