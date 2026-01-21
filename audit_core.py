@@ -405,7 +405,8 @@ def call_openai_json(
         except Exception:
             pass
 
-    if hasattr(client.chat.completions, "parse"):
+    use_chat_parse = os.getenv("OPENAI_USE_CHAT_PARSE", "false").lower() in {"1", "true", "yes"}
+    if use_chat_parse and hasattr(client.chat.completions, "parse"):
         try:
             kwargs = {
                 "model": model,
