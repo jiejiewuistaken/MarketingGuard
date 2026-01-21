@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -163,6 +164,14 @@ def extract_keywords(text: str) -> List[str]:
 
 def format_rules(rules: Sequence[Rule]) -> str:
     return "\n".join(f"{rule.rule_id}. {rule.text}" for rule in rules)
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return text
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 20].rstrip() + " ...[TRUNCATED]"
 
 
 def normalize_text(text: str) -> str:
@@ -330,6 +339,38 @@ def encode_image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{b64}"
 
 
+def shrink_image_bytes(
+    image_bytes: bytes,
+    mime_type: str,
+    max_bytes: int,
+    max_side: int,
+) -> Tuple[bytes, str]:
+    if not image_bytes or len(image_bytes) <= max_bytes:
+        return image_bytes, mime_type
+    try:
+        from PIL import Image
+    except Exception:
+        return image_bytes, mime_type
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        width, height = image.size
+        scale = min(1.0, max_side / max(width, height))
+        if scale < 1.0:
+            image = image.resize((int(width * scale), int(height * scale)), Image.LANCZOS)
+        quality_steps = (85, 75, 65, 55)
+        last_bytes: bytes = image_bytes
+        for quality in quality_steps:
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality, optimize=True)
+            candidate = buffer.getvalue()
+            last_bytes = candidate
+            if len(candidate) <= max_bytes:
+                return candidate, "image/jpeg"
+        return last_bytes, "image/jpeg"
+
+
 def extract_json_payload(text: str) -> str:
     if not text:
         return text
@@ -457,6 +498,9 @@ def build_audit_prompts(
     rules: Sequence[Rule],
     include_rules: bool,
 ) -> Tuple[str, str]:
+    max_ocr_chars = int(os.getenv("MAX_OCR_CHARS", "4000"))
+    max_rule_chars = int(os.getenv("MAX_RULE_CHARS", "4000"))
+    ocr_text = truncate_text(ocr_text or "", max_ocr_chars)
     system_prompt = (
         "You are a compliance auditor for fund marketing materials. "
         "Use the provided rules to identify violations. "
@@ -464,6 +508,7 @@ def build_audit_prompts(
         "Keep evidence concise and directly quoted when possible."
     )
     rules_block = format_rules(rules) if include_rules else "No rules provided."
+    rules_block = truncate_text(rules_block, max_rule_chars)
     user_prompt = (
         f"Poster name: {poster_name}\n\n"
         f"OCR text:\n{ocr_text or '[EMPTY]'}\n\n"
@@ -546,6 +591,12 @@ def audit_with_llm(
     image_mime: str = "image/png",
     include_rules: bool = True,
 ) -> AuditResult:
+    max_image_bytes = int(os.getenv("MAX_IMAGE_BYTES", "600000"))
+    max_image_side = int(os.getenv("MAX_IMAGE_SIDE", "1024"))
+    if image_bytes:
+        image_bytes, image_mime = shrink_image_bytes(
+            image_bytes, image_mime, max_bytes=max_image_bytes, max_side=max_image_side
+        )
     system_prompt, user_prompt = build_audit_prompts(poster_name, ocr_text, rules, include_rules)
     image_data_url = None
     if image_bytes:
