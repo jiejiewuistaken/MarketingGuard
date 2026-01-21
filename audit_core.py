@@ -363,14 +363,30 @@ def call_openai_json(
         },
     }
 
-    if hasattr(client, "responses") and hasattr(client.responses, "parse"):
-        response = client.responses.parse(
-            model=model,
-            input=response_input,
-            response_format=response_model,
-            extra_headers=extra_headers,
-        )
-        return response.output_parsed
+    if hasattr(client, "responses") and hasattr(client.responses, "create"):
+        try:
+            response = client.responses.create(
+                model=model,
+                input=response_input,
+                response_format=response_format,
+                extra_headers=extra_headers,
+            )
+            payload = getattr(response, "output_text", "") or ""
+            if not payload and getattr(response, "output", None):
+                chunks: List[str] = []
+                for output in response.output:
+                    content = getattr(output, "content", None)
+                    if not content:
+                        continue
+                    for item in content:
+                        text = getattr(item, "text", None)
+                        if text:
+                            chunks.append(text)
+                payload = "\n".join(chunks)
+            if payload:
+                return model_validate_json_safe(response_model, payload)
+        except Exception:
+            pass
 
     response = client.chat.completions.create(
         model=model,
