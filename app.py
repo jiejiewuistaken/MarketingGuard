@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import mimetypes
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -25,6 +27,25 @@ from audit_core import (
 
 
 st.set_page_config(page_title="MarketingGuard", layout="wide")
+
+DEMO_IMAGE_PATH = Path("图片文件") / "易方达中债新综合周报.png"
+DEMO_OCR_PATH = Path("demo_ocr.txt")
+DEMO_RULES_PATH = Path("demo_rules.txt")
+
+
+@dataclass
+class LocalFile:
+    path: Path
+    name: str
+    type: str
+
+    def getvalue(self) -> bytes:
+        return self.path.read_bytes()
+
+
+def build_local_file(path: Path) -> LocalFile:
+    mime_type, _ = mimetypes.guess_type(str(path))
+    return LocalFile(path=path, name=path.name, type=mime_type or "application/octet-stream")
 
 
 def bytes_to_base64(image_bytes: bytes) -> str:
@@ -110,15 +131,15 @@ with st.sidebar:
     use_rag = st.checkbox("Use RAG (hybrid recall)", value=True)
     strategy = st.selectbox("Strategy", ["rule_vlm", "rule_only", "llm_only"], index=0)
     cache_dir = st.text_input("Rule index cache dir", value=".cache")
+    use_demo = st.checkbox("Use demo data by default", value=True)
 
     st.divider()
     st.subheader("Rules")
     rules_file = st.file_uploader("Upload rules (.txt/.md)", type=["txt", "md"])
-    rules_text = st.text_area(
-        "Or paste rules here",
-        value="Rule 1. Do not promise returns or guarantee principal.",
-        height=140,
-    )
+    default_rules_text = "Rule 1. Do not promise returns or guarantee principal."
+    if DEMO_RULES_PATH.exists():
+        default_rules_text = DEMO_RULES_PATH.read_text(encoding="utf-8", errors="ignore").strip()
+    rules_text = st.text_area("Or paste rules here", value=default_rules_text, height=140)
 
     if rules_file is not None:
         rules_text = rules_file.getvalue().decode("utf-8", errors="ignore")
@@ -131,10 +152,23 @@ ocr_files = st.file_uploader(
     "Upload OCR text (MD/TXT)", type=["md", "txt"], accept_multiple_files=True
 )
 
+effective_images = image_files or []
+effective_ocr_files = ocr_files or []
+if use_demo and not image_files:
+    if DEMO_IMAGE_PATH.exists():
+        effective_images = [build_local_file(DEMO_IMAGE_PATH)]
+    else:
+        st.warning(f"Demo image not found at {DEMO_IMAGE_PATH}")
+if use_demo and not ocr_files:
+    if DEMO_OCR_PATH.exists():
+        effective_ocr_files = [build_local_file(DEMO_OCR_PATH)]
+    else:
+        st.warning(f"Demo OCR not found at {DEMO_OCR_PATH}")
+
 run_button = st.button("Run audit")
 
 if run_button:
-    if not image_files:
+    if not effective_images:
         st.error("Please upload at least one poster image.")
         st.stop()
 
@@ -159,11 +193,11 @@ if run_button:
         rule_index = RuleIndex(parsed_rules, embedder, cache_path=cache_path)
         rule_index.build()
 
-    ocr_map = load_ocr_texts(ocr_files)
+    ocr_map = load_ocr_texts(effective_ocr_files)
 
     results: Dict[str, AuditResult] = {}
     latency_map: Dict[str, float] = {}
-    for image_file in image_files:
+    for image_file in effective_images:
         poster_name = image_file.name
         ocr_text = ocr_map.get(Path(poster_name).stem, "")
         start = time.time()
@@ -188,19 +222,19 @@ if run_button:
     st.session_state["ocr_map"] = ocr_map
     st.session_state["latency_map"] = latency_map
 
-if "audit_results" in st.session_state and image_files:
+if "audit_results" in st.session_state and effective_images:
     results = st.session_state["audit_results"]
     ocr_map = st.session_state.get("ocr_map", {})
-    poster_names = [file.name for file in image_files]
+    poster_names = [file.name for file in effective_images]
     selected_index = st.slider("Poster index", 0, len(poster_names) - 1, 0)
     selected_name = poster_names[selected_index]
 
-    render_gallery(image_files, selected_name)
+    render_gallery(effective_images, selected_name)
 
     left_col, right_col = st.columns([1.35, 1])
     with left_col:
         st.subheader("Poster preview")
-        selected_file = next(file for file in image_files if file.name == selected_name)
+        selected_file = next(file for file in effective_images if file.name == selected_name)
         st.image(selected_file.getvalue(), caption=selected_name, use_column_width=True)
         if selected_name in results:
             st.caption("Overall confidence")
@@ -250,7 +284,7 @@ if "audit_results" in st.session_state and image_files:
         for mode in ["rule_only", "llm_only", "rule_vlm"]:
             start = time.time()
             predictions: List[AuditResult] = []
-            for image_file in image_files:
+            for image_file in effective_images:
                 poster_name = image_file.name
                 ocr_text = ocr_map.get(Path(poster_name).stem, "")
                 predictions.append(
