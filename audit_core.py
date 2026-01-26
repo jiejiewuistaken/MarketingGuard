@@ -6,9 +6,11 @@ import json
 import os
 import re
 import time
+from io import BytesIO
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
+from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -325,7 +327,62 @@ def parse_extra_headers(raw_headers: Optional[str]) -> Dict[str, str]:
     return {str(key): str(value) for key, value in parsed.items()}
 
 
-def encode_image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
+DEFAULT_MAX_IMAGE_BYTES = 700_000
+DEFAULT_MAX_IMAGE_DIMENSION = 1600
+DEFAULT_MIN_IMAGE_DIMENSION = 512
+DEFAULT_MIN_JPEG_QUALITY = 45
+
+
+def compress_image_bytes(
+    image_bytes: bytes,
+    max_bytes: int,
+    max_dimension: int = DEFAULT_MAX_IMAGE_DIMENSION,
+    min_dimension: int = DEFAULT_MIN_IMAGE_DIMENSION,
+    min_quality: int = DEFAULT_MIN_JPEG_QUALITY,
+) -> Optional[Tuple[bytes, str]]:
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except Exception:
+        return None
+
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    if max_dimension and max(image.size) > max_dimension:
+        image.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+
+    quality = 85
+    while True:
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= max_bytes:
+            return data, "image/jpeg"
+        if quality > min_quality:
+            quality -= 10
+            continue
+        width, height = image.size
+        if min(width, height) <= min_dimension:
+            return None
+        new_size = (
+            max(min_dimension, int(width * 0.85)),
+            max(min_dimension, int(height * 0.85)),
+        )
+        if new_size == image.size:
+            return None
+        image = image.resize(new_size, Image.LANCZOS)
+        quality = 80
+
+
+def encode_image_to_data_url(image_bytes: bytes, mime_type: str) -> Optional[str]:
+    max_bytes = int(os.getenv("OPENAI_MAX_IMAGE_BYTES", DEFAULT_MAX_IMAGE_BYTES))
+    if max_bytes > 0 and len(image_bytes) > max_bytes:
+        compressed = compress_image_bytes(image_bytes, max_bytes)
+        if compressed is None:
+            return None
+        image_bytes, mime_type = compressed
+        if len(image_bytes) > max_bytes:
+            return None
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{b64}"
 
@@ -533,15 +590,30 @@ def audit_with_llm(
     image_data_url = None
     if image_bytes:
         image_data_url = encode_image_to_data_url(image_bytes, image_mime)
-    result = call_openai_json(
-        client=client,
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        image_data_url=image_data_url,
-        response_model=AuditResult,
-        extra_headers=extra_headers,
-    )
+    try:
+        result = call_openai_json(
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_data_url=image_data_url,
+            response_model=AuditResult,
+            extra_headers=extra_headers,
+        )
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 413 and image_data_url:
+            result = call_openai_json(
+                client=client,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_data_url=None,
+                response_model=AuditResult,
+                extra_headers=extra_headers,
+            )
+        else:
+            raise
     return normalize_audit_result(result, poster_name)
 
 
