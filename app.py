@@ -222,7 +222,7 @@ if "audit_results" in st.session_state and image_files:
             st.info("No violations detected.")
         else:
             df = pd.DataFrame([model_dump_safe(v) for v in result.violations])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
     st.divider()
     render_confidence_bars(results)
@@ -284,4 +284,4 @@ if "audit_results" in st.session_state and image_files:
                 )
             )
         metrics_df = pd.DataFrame([model_dump_safe(m) for m in metrics])
-        st.dataframe(metrics_df, use_container_width=True)
+        st.dataframe(metrics_df, width="stretch")

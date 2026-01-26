@@ -6,9 +6,11 @@ import json
 import os
 import re
 import time
+from io import BytesIO
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
+from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -325,7 +327,102 @@ def parse_extra_headers(raw_headers: Optional[str]) -> Dict[str, str]:
     return {str(key): str(value) for key, value in parsed.items()}
 
 
-def encode_image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
+DEFAULT_MAX_IMAGE_BYTES = 350_000
+DEFAULT_MAX_IMAGE_DIMENSION = 1600
+DEFAULT_MIN_IMAGE_DIMENSION = 512
+DEFAULT_MIN_JPEG_QUALITY = 45
+DEFAULT_MAX_OCR_CHARS = 6000
+DEFAULT_MAX_RULE_CHARS = 12000
+DEFAULT_MAX_RULES = 40
+DEFAULT_FALLBACK_MAX_OCR_CHARS = 3000
+DEFAULT_FALLBACK_MAX_RULE_CHARS = 5000
+DEFAULT_FALLBACK_MAX_RULES = 20
+
+
+def get_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def truncate_text(text: str, max_chars: int) -> Tuple[str, bool]:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    return text[:max_chars].rstrip() + "\n...[truncated]", True
+
+
+def format_rules_limited(
+    rules: Sequence[Rule],
+    max_chars: int,
+    max_rules: int,
+) -> Tuple[str, bool]:
+    if not rules:
+        return "No rules provided.", False
+    lines: List[str] = []
+    total = 0
+    for rule in rules:
+        if max_rules > 0 and len(lines) >= max_rules:
+            return "\n".join(lines + ["... [truncated rules]"]), True
+        line = f"{rule.rule_id}. {rule.text}"
+        projected = total + len(line) + (1 if lines else 0)
+        if max_chars > 0 and projected > max_chars:
+            return "\n".join(lines + ["... [truncated rules]"]), True
+        lines.append(line)
+        total = projected
+    return "\n".join(lines), False
+
+
+def compress_image_bytes(
+    image_bytes: bytes,
+    max_bytes: int,
+    max_dimension: int = DEFAULT_MAX_IMAGE_DIMENSION,
+    min_dimension: int = DEFAULT_MIN_IMAGE_DIMENSION,
+    min_quality: int = DEFAULT_MIN_JPEG_QUALITY,
+) -> Optional[Tuple[bytes, str]]:
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except Exception:
+        return None
+
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    if max_dimension and max(image.size) > max_dimension:
+        image.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+
+    quality = 85
+    while True:
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= max_bytes:
+            return data, "image/jpeg"
+        if quality > min_quality:
+            quality -= 10
+            continue
+        width, height = image.size
+        if min(width, height) <= min_dimension:
+            return None
+        new_size = (
+            max(min_dimension, int(width * 0.85)),
+            max(min_dimension, int(height * 0.85)),
+        )
+        if new_size == image.size:
+            return None
+        image = image.resize(new_size, Image.LANCZOS)
+        quality = 80
+
+
+def encode_image_to_data_url(image_bytes: bytes, mime_type: str) -> Optional[str]:
+    max_bytes = get_env_int("OPENAI_MAX_IMAGE_BYTES", DEFAULT_MAX_IMAGE_BYTES)
+    if max_bytes > 0 and len(image_bytes) > max_bytes:
+        compressed = compress_image_bytes(image_bytes, max_bytes)
+        if compressed is None:
+            return None
+        image_bytes, mime_type = compressed
+        if len(image_bytes) > max_bytes:
+            return None
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{b64}"
 
@@ -439,6 +536,9 @@ def build_audit_prompts(
     ocr_text: str,
     rules: Sequence[Rule],
     include_rules: bool,
+    max_ocr_chars: Optional[int] = None,
+    max_rules_chars: Optional[int] = None,
+    max_rules: Optional[int] = None,
 ) -> Tuple[str, str]:
     system_prompt = (
         "You are a compliance auditor for fund marketing materials. "
@@ -446,10 +546,26 @@ def build_audit_prompts(
         "Output JSON that strictly matches the schema. "
         "Keep evidence concise and directly quoted when possible."
     )
-    rules_block = format_rules(rules) if include_rules else "No rules provided."
+    ocr_limit = get_env_int("OPENAI_MAX_OCR_CHARS", DEFAULT_MAX_OCR_CHARS)
+    rules_chars_limit = get_env_int("OPENAI_MAX_RULE_CHARS", DEFAULT_MAX_RULE_CHARS)
+    rules_limit = get_env_int("OPENAI_MAX_RULES", DEFAULT_MAX_RULES)
+    if max_ocr_chars is not None:
+        ocr_limit = max_ocr_chars
+    if max_rules_chars is not None:
+        rules_chars_limit = max_rules_chars
+    if max_rules is not None:
+        rules_limit = max_rules
+
+    trimmed_ocr, _ = truncate_text(ocr_text or "", ocr_limit)
+    if not trimmed_ocr:
+        trimmed_ocr = "[EMPTY]"
+    if include_rules:
+        rules_block, _ = format_rules_limited(rules, rules_chars_limit, rules_limit)
+    else:
+        rules_block = "No rules provided."
     user_prompt = (
         f"Poster name: {poster_name}\n\n"
-        f"OCR text:\n{ocr_text or '[EMPTY]'}\n\n"
+        f"OCR text:\n{trimmed_ocr}\n\n"
         f"Rules:\n{rules_block}\n\n"
         "Task:\n"
         "- List every violation found in the poster.\n"
@@ -533,15 +649,59 @@ def audit_with_llm(
     image_data_url = None
     if image_bytes:
         image_data_url = encode_image_to_data_url(image_bytes, image_mime)
-    result = call_openai_json(
-        client=client,
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        image_data_url=image_data_url,
-        response_model=AuditResult,
-        extra_headers=extra_headers,
-    )
+    try:
+        result = call_openai_json(
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_data_url=image_data_url,
+            response_model=AuditResult,
+            extra_headers=extra_headers,
+        )
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code != 413:
+            raise
+        if image_data_url:
+            try:
+                result = call_openai_json(
+                    client=client,
+                    model=model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    image_data_url=None,
+                    response_model=AuditResult,
+                    extra_headers=extra_headers,
+                )
+            except Exception as retry_exc:
+                if getattr(retry_exc, "status_code", None) != 413:
+                    raise
+            else:
+                return normalize_audit_result(result, poster_name)
+
+        compact_system, compact_user = build_audit_prompts(
+            poster_name=poster_name,
+            ocr_text=ocr_text,
+            rules=rules,
+            include_rules=include_rules,
+            max_ocr_chars=get_env_int(
+                "OPENAI_FALLBACK_MAX_OCR_CHARS", DEFAULT_FALLBACK_MAX_OCR_CHARS
+            ),
+            max_rules_chars=get_env_int(
+                "OPENAI_FALLBACK_MAX_RULE_CHARS", DEFAULT_FALLBACK_MAX_RULE_CHARS
+            ),
+            max_rules=get_env_int("OPENAI_FALLBACK_MAX_RULES", DEFAULT_FALLBACK_MAX_RULES),
+        )
+        result = call_openai_json(
+            client=client,
+            model=model,
+            system_prompt=compact_system,
+            user_prompt=compact_user,
+            image_data_url=None,
+            response_model=AuditResult,
+            extra_headers=extra_headers,
+        )
     return normalize_audit_result(result, poster_name)
 
 

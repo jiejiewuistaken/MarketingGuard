@@ -3,3 +3,4 @@ pydantic
 streamlit
 pandas
 python-dotenv
+pillow
