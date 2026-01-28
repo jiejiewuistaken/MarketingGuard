@@ -11,12 +11,17 @@ import pandas as pd
 import streamlit as st
 
 from audit_core import (
-    AuditMetrics,
     AuditResult,
+    ComplianceMetrics,
+    ComplianceRow,
     EmbeddingProvider,
     RuleIndex,
     build_openai_client,
-    compute_metrics,
+    coerce_compliance_rows,
+    compliance_rows_from_audit_results,
+    compliance_rows_to_records,
+    compute_compliance_metrics,
+    explode_compliance_rows,
     model_dump_safe,
     parse_extra_headers,
     parse_rules,
@@ -42,23 +47,19 @@ def load_ocr_texts(files: List) -> Dict[str, str]:
     return ocr_map
 
 
-def load_ground_truth(file) -> Dict[str, List[str]]:
+def load_ground_truth_rows(file) -> List[ComplianceRow]:
     if file is None:
-        return {}
+        return []
     if file.name.lower().endswith(".csv"):
         df = pd.read_csv(file)
     else:
         df = pd.read_excel(file)
-    if "poster_name" not in df.columns or "rule_id" not in df.columns:
-        st.warning("Ground truth file must include poster_name and rule_id columns.")
-        return {}
-    mapping: Dict[str, List[str]] = {}
-    for _, row in df.iterrows():
-        poster_name = str(row["poster_name"]).strip()
-        rule_ids = str(row["rule_id"]).replace(";", ",")
-        rules = [item.strip() for item in rule_ids.split(",") if item.strip()]
-        mapping.setdefault(poster_name, []).extend(rules)
-    return mapping
+    rows = explode_compliance_rows(coerce_compliance_rows(df.to_dict(orient="records")))
+    if not any(row.filename and row.error_id for row in rows):
+        st.warning(
+            "Ground truth file must include 文件名/错误id (or poster_name/rule_id) columns."
+        )
+    return rows
 
 
 def render_gallery(image_files: List, selected_name: str) -> None:
@@ -228,6 +229,23 @@ if "audit_results" in st.session_state and image_files:
     render_confidence_bars(results)
 
     st.divider()
+    st.subheader("Export predictions")
+    pred_rows = compliance_rows_from_audit_results(results.values(), normalize_ids=True)
+    if pred_rows:
+        pred_records = compliance_rows_to_records(pred_rows, by_alias=True)
+        pred_df = pd.DataFrame(pred_records)
+        csv_data = pred_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Download predictions CSV",
+            csv_data,
+            file_name="predictions.csv",
+            mime="text/csv",
+        )
+        st.caption("Columns: 文件名, 一级分类, 二级分类, 是否校验, 错误id, 错误描述, 合规规则名称.")
+    else:
+        st.info("No violations to export.")
+
+    st.divider()
     st.subheader("Comparison runner")
     st.caption("Run baseline comparisons: rule-only, LLM-only, and rule+VLM.")
     gt_file = st.file_uploader("Upload ground truth (CSV/XLSX)", type=["csv", "xlsx"])
@@ -236,8 +254,8 @@ if "audit_results" in st.session_state and image_files:
         if not api_key:
             st.error("OPENAI_API_KEY is required for LLM comparisons.")
             st.stop()
-        ground_truth = load_ground_truth(gt_file)
-        if not ground_truth:
+        ground_truth_rows = load_ground_truth_rows(gt_file)
+        if not ground_truth_rows:
             st.warning("Ground truth missing or invalid. Metrics will be zero.")
         comparison_rules = parse_rules(rules_text)
         extra_headers = parse_extra_headers(extra_headers_raw)
@@ -251,7 +269,7 @@ if "audit_results" in st.session_state and image_files:
             comparison_index = RuleIndex(comparison_rules, embedder, cache_path=cache_path)
             comparison_index.build()
 
-        metrics: List[AuditMetrics] = []
+        metrics: List[ComplianceMetrics] = []
         for mode in ["rule_only", "llm_only", "rule_vlm"]:
             start = time.time()
             predictions: List[AuditResult] = []
@@ -275,12 +293,20 @@ if "audit_results" in st.session_state and image_files:
                     )
                 )
             latency_ms = (time.time() - start) * 1000
+            avg_conf = (
+                sum(p.overall_confidence for p in predictions) / len(predictions)
+                if predictions
+                else 0.0
+            )
+            pred_rows = compliance_rows_from_audit_results(predictions, normalize_ids=True)
             metrics.append(
-                compute_metrics(
-                    predictions=predictions,
-                    ground_truth=ground_truth,
+                compute_compliance_metrics(
+                    predicted_rows=pred_rows,
+                    ground_truth_rows=ground_truth_rows,
                     strategy=mode,
                     latency_ms=latency_ms,
+                    avg_confidence=avg_conf,
+                    all_filenames=poster_names,
                 )
             )
         metrics_df = pd.DataFrame([model_dump_safe(m) for m in metrics])
