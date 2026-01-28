@@ -157,7 +157,8 @@ if run_button:
 
     rule_index = None
     if use_rag or strategy == "llm_only":
-        cache_path = os.path.join(cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json")
+        rules_hash = hashlib.sha256(rules_text.encode()).hexdigest()
+        cache_path = os.path.join(cache_dir, f"rules_{rules_hash}.json")
         embedder = EmbeddingProvider(client, embedding_model)
         rule_index = RuleIndex(parsed_rules, embedder, cache_path=cache_path)
         rule_index.build()
@@ -190,6 +191,8 @@ if run_button:
     st.session_state["audit_results"] = results
     st.session_state["ocr_map"] = ocr_map
     st.session_state["latency_map"] = latency_map
+    st.session_state["rule_index"] = rule_index
+    st.session_state["rules_hash"] = hashlib.sha256(rules_text.encode()).hexdigest()
 
 if "audit_results" in st.session_state and image_files:
     results = st.session_state["audit_results"]
@@ -260,10 +263,15 @@ if "audit_results" in st.session_state and image_files:
         comparison_rules = parse_rules(rules_text)
         extra_headers = parse_extra_headers(extra_headers_raw)
         comparison_client = build_openai_client(api_key=api_key, base_url=base_url)
-        comparison_index = rule_index
+        rules_hash = hashlib.sha256(rules_text.encode()).hexdigest()
+        comparison_index = (
+            st.session_state.get("rule_index")
+            if st.session_state.get("rules_hash") == rules_hash
+            else None
+        )
         if comparison_index is None:
             cache_path = os.path.join(
-                cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json"
+                cache_dir, f"rules_{rules_hash}.json"
             )
             embedder = EmbeddingProvider(comparison_client, embedding_model)
             comparison_index = RuleIndex(comparison_rules, embedder, cache_path=cache_path)
