@@ -29,4 +29,32 @@ export OPENAI_EXTRA_HEADERS='{"X-Custom-Header": "value"}'
 
 - If you only want to run the rule-only baseline, you can skip API keys.
 - For batch audit, upload OCR text files with the same stem name as the image.
-- Ground truth files should include `poster_name` and `rule_id` columns.
+- Ground truth can use `poster_name`/`rule_id` or the Chinese headers listed below.
+
+## Evaluation / test plan
+
+Ground truth CSV/XLSX columns (Chinese headers):
+
+- 文件名
+- 一级分类
+- 二级分类
+- 是否校验
+- 错误id
+- 错误描述
+- 合规规则名称
+
+You can export predictions from the Streamlit app via **Export predictions**. The
+downloaded CSV uses the same headers so it can be compared directly.
+
+Run offline evaluation:
+
+```bash
+python evaluate_compliance.py \
+  --predictions predictions.csv \
+  --ground-truth ground_truth.xlsx \
+  --metrics-out metrics.json
+```
+
+Metrics include precision/recall/F1 on (文件名 + 错误id), exact-match rate per file,
+and field accuracies for 一级分类/二级分类/是否校验/合规规则名称 when present. Filenames
+are normalized by stem and error_id values are normalized to digits (e.g. R334 = 334).

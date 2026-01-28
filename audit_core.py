@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter, defaultdict
 import hashlib
 import json
 import os
@@ -46,12 +47,13 @@ class AuditResult(BaseModel):
 class ComplianceRow(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    filename: str = Field(alias="文件名")
-    level1: str = Field(alias="一级分类")
-    level2: str = Field(alias="二级分类")
-    error_id: str = Field(alias="错误id")
-    error_description: str = Field(alias="错误描述")
-    rule_name: str = Field(alias="合规规则名称")
+    filename: str = Field(default="", alias="文件名")
+    level1: str = Field(default="", alias="一级分类")
+    level2: str = Field(default="", alias="二级分类")
+    checked: str = Field(default="", alias="是否校验")
+    error_id: str = Field(default="", alias="错误id")
+    error_description: str = Field(default="", alias="错误描述")
+    rule_name: str = Field(default="", alias="合规规则名称")
 
 
 class ComplianceTable(BaseModel):
@@ -71,6 +73,31 @@ class AuditMetrics(BaseModel):
     latency_ms: float
 
 
+class ComplianceMetrics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: str
+    precision: float
+    recall: float
+    f1: float
+    exact_match_rate: float
+    total_truth: int
+    total_predicted: int
+    true_positive: int
+    false_positive: int
+    false_negative: int
+    level1_accuracy: float
+    level1_support: int
+    level2_accuracy: float
+    level2_support: int
+    checked_accuracy: float
+    checked_support: int
+    rule_name_accuracy: float
+    rule_name_support: int
+    latency_ms: float
+    avg_confidence: float
+
+
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
@@ -87,10 +114,10 @@ def model_validate_json_safe(model_cls: type, payload: str):
     return model_cls.parse_raw(payload)
 
 
-def model_dump_safe(model: BaseModel) -> Dict:
+def model_dump_safe(model: BaseModel, **kwargs) -> Dict:
     if hasattr(model, "model_dump"):
-        return model.model_dump()
-    return model.dict()
+        return model.model_dump(**kwargs)
+    return model.dict(**kwargs)
 
 
 def parse_rules(raw_text: str) -> List[Rule]:
@@ -167,6 +194,107 @@ def format_rules(rules: Sequence[Rule]) -> str:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
+def normalize_filename(name: str) -> str:
+    if not name:
+        return ""
+    cleaned = str(name).strip()
+    base = os.path.basename(cleaned)
+    stem, _ = os.path.splitext(base)
+    return stem or base
+
+
+def normalize_error_id(value: str) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    digits = re.findall(r"\d+", text)
+    if digits:
+        trimmed = digits[0].lstrip("0")
+        return trimmed or digits[0]
+    return text.upper()
+
+
+def normalize_label(value: str) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return re.sub(r"\s+", "", text).lower()
+
+
+def normalize_checked(value: str) -> str:
+    normalized = normalize_label(value)
+    if normalized in {"是", "yes", "true", "1", "y", "checked", "已校验"}:
+        return "yes"
+    if normalized in {"否", "no", "false", "0", "n", "unchecked", "未校验"}:
+        return "no"
+    return normalized
+
+
+def _sanitize_cell(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null", "<na>"}:
+        return ""
+    return text
+
+
+COMPLIANCE_COLUMN_ALIASES: Dict[str, Sequence[str]] = {
+    "filename": ["文件名", "poster_name", "filename", "file_name", "name"],
+    "level1": ["一级分类", "level1", "category1", "primary_category"],
+    "level2": ["二级分类", "level2", "category2", "secondary_category"],
+    "checked": ["是否校验", "is_checked", "checked", "verified"],
+    "error_id": ["错误id", "error_id", "rule_id", "id"],
+    "error_description": ["错误描述", "error_description", "description", "evidence"],
+    "rule_name": ["合规规则名称", "rule_name", "rule_text", "rule"],
+}
+
+
+def coerce_compliance_rows(records: Iterable[Dict[str, object]]) -> List[ComplianceRow]:
+    rows: List[ComplianceRow] = []
+    for record in records:
+        payload: Dict[str, str] = {}
+        for field, candidates in COMPLIANCE_COLUMN_ALIASES.items():
+            value = ""
+            for candidate in candidates:
+                if candidate in record and record[candidate] not in (None, ""):
+                    value = record[candidate]
+                    break
+            payload[field] = _sanitize_cell(value)
+        rows.append(ComplianceRow(**payload))
+    return rows
+
+
+def compliance_rows_to_records(
+    rows: Sequence[ComplianceRow],
+    by_alias: bool = True,
+) -> List[Dict[str, str]]:
+    return [model_dump_safe(row, by_alias=by_alias) for row in rows]
+
+
+def _copy_compliance_row(row: ComplianceRow, **updates: str) -> ComplianceRow:
+    if hasattr(row, "model_copy"):
+        return row.model_copy(update=updates)
+    return row.copy(update=updates)
+
+
+def explode_compliance_rows(rows: Sequence[ComplianceRow]) -> List[ComplianceRow]:
+    expanded: List[ComplianceRow] = []
+    for row in rows:
+        if not row.error_id:
+            expanded.append(row)
+            continue
+        parts = [part.strip() for part in re.split(r"[;,，、]", row.error_id) if part.strip()]
+        if len(parts) <= 1:
+            expanded.append(row)
+            continue
+        for part in parts:
+            expanded.append(_copy_compliance_row(row, error_id=part))
+    return expanded
 
 
 def find_keyword_evidence(text: str, keywords: Sequence[str], window: int = 40) -> Optional[str]:
@@ -605,6 +733,46 @@ def run_audit(
     return result
 
 
+def compliance_rows_from_audit_results(
+    results: Iterable[AuditResult],
+    default_level1: str = "",
+    default_level2: str = "",
+    default_checked: str = "",
+    normalize_ids: bool = True,
+) -> List[ComplianceRow]:
+    rows: List[ComplianceRow] = []
+    for result in results:
+        if not result.violations:
+            continue
+        for violation in result.violations:
+            error_id = violation.rule_id or ""
+            if normalize_ids:
+                error_id = normalize_error_id(error_id)
+            rows.append(
+                ComplianceRow(
+                    filename=result.poster_name,
+                    level1=default_level1,
+                    level2=default_level2,
+                    checked=default_checked,
+                    error_id=error_id,
+                    error_description=violation.evidence or "",
+                    rule_name=violation.rule_text or "",
+                )
+            )
+    return rows
+
+
+def ground_truth_map_from_rows(rows: Sequence[ComplianceRow]) -> Dict[str, List[str]]:
+    mapping: Dict[str, List[str]] = {}
+    for row in rows:
+        filename = normalize_filename(row.filename)
+        error_id = normalize_error_id(row.error_id)
+        if not filename or not error_id:
+            continue
+        mapping.setdefault(filename, []).append(error_id)
+    return mapping
+
+
 def compute_metrics(
     predictions: Sequence[AuditResult],
     ground_truth: Dict[str, List[str]],
@@ -616,8 +784,13 @@ def compute_metrics(
     total_fn = 0
     confidences: List[float] = []
     for prediction in predictions:
-        predicted = {v.rule_id for v in prediction.violations}
-        truth = set(ground_truth.get(prediction.poster_name, []))
+        predicted = {
+            normalize_error_id(v.rule_id)
+            for v in prediction.violations
+            if normalize_error_id(v.rule_id)
+        }
+        name_key = normalize_filename(prediction.poster_name)
+        truth = {normalize_error_id(rid) for rid in ground_truth.get(name_key, [])}
         total_tp += len(predicted & truth)
         total_fp += len(predicted - truth)
         total_fn += len(truth - predicted)
@@ -633,4 +806,120 @@ def compute_metrics(
         f1=f1,
         avg_confidence=avg_conf,
         latency_ms=latency_ms,
+    )
+
+
+def compute_compliance_metrics(
+    predicted_rows: Sequence[ComplianceRow],
+    ground_truth_rows: Sequence[ComplianceRow],
+    strategy: str,
+    latency_ms: float,
+    avg_confidence: float = 0.0,
+    all_filenames: Optional[Iterable[str]] = None,
+) -> ComplianceMetrics:
+    def build_key(row: ComplianceRow) -> Optional[Tuple[str, str]]:
+        filename = normalize_filename(row.filename)
+        error_id = normalize_error_id(row.error_id)
+        if not filename and not error_id:
+            return None
+        return (filename, error_id)
+
+    pred_counter: Counter = Counter()
+    truth_counter: Counter = Counter()
+    pred_map: Dict[Tuple[str, str], ComplianceRow] = {}
+    truth_map: Dict[Tuple[str, str], ComplianceRow] = {}
+
+    for row in predicted_rows:
+        key = build_key(row)
+        if key is None:
+            continue
+        pred_counter[key] += 1
+        pred_map.setdefault(key, row)
+
+    for row in ground_truth_rows:
+        key = build_key(row)
+        if key is None:
+            continue
+        truth_counter[key] += 1
+        truth_map.setdefault(key, row)
+
+    tp = sum((pred_counter & truth_counter).values())
+    fp = sum((pred_counter - truth_counter).values())
+    fn = sum((truth_counter - pred_counter).values())
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    matched_keys = set(pred_map) & set(truth_map)
+
+    def field_accuracy(field: str, normalizer) -> Tuple[float, int]:
+        total = 0
+        correct = 0
+        for key in matched_keys:
+            pred_value = normalizer(getattr(pred_map[key], field))
+            truth_value = normalizer(getattr(truth_map[key], field))
+            if not pred_value or not truth_value:
+                continue
+            total += 1
+            if pred_value == truth_value:
+                correct += 1
+        return (correct / total if total else 0.0, total)
+
+    level1_acc, level1_support = field_accuracy("level1", normalize_label)
+    level2_acc, level2_support = field_accuracy("level2", normalize_label)
+    checked_acc, checked_support = field_accuracy("checked", normalize_checked)
+    rule_name_acc, rule_name_support = field_accuracy("rule_name", normalize_label)
+
+    pred_by_file: Dict[str, set] = defaultdict(set)
+    truth_by_file: Dict[str, set] = defaultdict(set)
+
+    for row in predicted_rows:
+        filename = normalize_filename(row.filename)
+        error_id = normalize_error_id(row.error_id)
+        if not filename or not error_id:
+            continue
+        pred_by_file[filename].add(error_id)
+
+    for row in ground_truth_rows:
+        filename = normalize_filename(row.filename)
+        error_id = normalize_error_id(row.error_id)
+        if not filename or not error_id:
+            continue
+        truth_by_file[filename].add(error_id)
+
+    if all_filenames is None:
+        file_names = set(pred_by_file) | set(truth_by_file)
+    else:
+        file_names = {normalize_filename(name) for name in all_filenames if name}
+
+    if not file_names:
+        exact_match_rate = 0.0
+    else:
+        matches = 0
+        for name in file_names:
+            if pred_by_file.get(name, set()) == truth_by_file.get(name, set()):
+                matches += 1
+        exact_match_rate = matches / len(file_names)
+
+    return ComplianceMetrics(
+        strategy=strategy,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        exact_match_rate=exact_match_rate,
+        total_truth=sum(truth_counter.values()),
+        total_predicted=sum(pred_counter.values()),
+        true_positive=tp,
+        false_positive=fp,
+        false_negative=fn,
+        level1_accuracy=level1_acc,
+        level1_support=level1_support,
+        level2_accuracy=level2_acc,
+        level2_support=level2_support,
+        checked_accuracy=checked_acc,
+        checked_support=checked_support,
+        rule_name_accuracy=rule_name_acc,
+        rule_name_support=rule_name_support,
+        latency_ms=latency_ms,
+        avg_confidence=avg_confidence,
     )
