@@ -55,6 +55,20 @@ python evaluate_compliance.py \
   --metrics-out metrics.json
 ```
 
-Metrics include precision/recall/F1 on (文件名 + 错误id), exact-match rate per file,
-and field accuracies for 一级分类/二级分类/是否校验/合规规则名称 when present. Filenames
-are normalized by stem and error_id values are normalized to digits (e.g. R334 = 334).
+Metrics are similarity-based (LLM generation friendly):
+
+- avg_gt_similarity: avg best similarity per ground-truth row
+- avg_pred_similarity: avg best similarity per predicted row
+- similarity_f1: harmonic mean of the two
+- gt_match_rate / pred_match_rate: fraction above threshold (default 0.7)
+
+Similarity uses `错误描述 + 合规规则名称` by default. Filenames are normalized by
+stem. You can customize fields/threshold via CLI:
+
+```bash
+python evaluate_compliance.py \
+  --predictions predictions.csv \
+  --ground-truth ground_truth.xlsx \
+  --similarity-threshold 0.75 \
+  --similarity-fields error_description,rule_name,level1
+```

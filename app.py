@@ -250,7 +250,10 @@ if "audit_results" in st.session_state and image_files:
 
     st.divider()
     st.subheader("Comparison runner")
-    st.caption("Run baseline comparisons: rule-only, LLM-only, and rule+VLM.")
+    st.caption(
+        "Run baseline comparisons: rule-only, LLM-only, and rule+VLM. Metrics use "
+        "text similarity on error description + rule name."
+    )
     gt_file = st.file_uploader("Upload ground truth (CSV/XLSX)", type=["csv", "xlsx"])
     confirm_run = st.checkbox("Confirm running comparison")
     if st.button("Run comparison") and confirm_run:

@@ -47,6 +47,8 @@ def run_eval(
     latency_ms: float,
     avg_confidence: float,
     all_filenames: Optional[Iterable[str]] = None,
+    similarity_threshold: float = 0.7,
+    similarity_fields: Optional[Iterable[str]] = None,
 ) -> ComplianceMetrics:
     predicted_rows = load_rows(predictions_path)
     ground_truth_rows = load_rows(ground_truth_path)
@@ -57,6 +59,8 @@ def run_eval(
         latency_ms=latency_ms,
         avg_confidence=avg_confidence,
         all_filenames=all_filenames,
+        similarity_threshold=similarity_threshold,
+        similarity_fields=tuple(similarity_fields) if similarity_fields else None,
     )
 
 
@@ -68,12 +72,31 @@ def main() -> None:
     parser.add_argument("--strategy", default="offline_eval")
     parser.add_argument("--latency-ms", type=float, default=0.0)
     parser.add_argument("--avg-confidence", type=float, default=0.0)
-    parser.add_argument("--all-files", help="CSV with filenames for exact-match rate")
+    parser.add_argument(
+        "--all-files",
+        help="Optional CSV of filenames (kept for compatibility)",
+    )
+    parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=0.7,
+        help="Similarity threshold for match rate",
+    )
+    parser.add_argument(
+        "--similarity-fields",
+        help="Comma-separated fields (e.g. error_description,rule_name)",
+    )
     args = parser.parse_args()
 
     all_filenames = None
     if args.all_files:
         all_filenames = load_all_filenames(args.all_files)
+
+    similarity_fields = None
+    if args.similarity_fields:
+        similarity_fields = [
+            field.strip() for field in args.similarity_fields.split(",") if field.strip()
+        ]
 
     metrics = run_eval(
         predictions_path=args.predictions,
@@ -82,6 +105,8 @@ def main() -> None:
         latency_ms=args.latency_ms,
         avg_confidence=args.avg_confidence,
         all_filenames=all_filenames,
+        similarity_threshold=args.similarity_threshold,
+        similarity_fields=similarity_fields,
     )
     print(json.dumps(model_dump_safe(metrics), ensure_ascii=False, indent=2))
 

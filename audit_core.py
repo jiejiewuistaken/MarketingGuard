@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import base64
-from collections import Counter, defaultdict
+from collections import defaultdict
+import difflib
 import hashlib
 import json
 import os
@@ -77,23 +78,14 @@ class ComplianceMetrics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy: str
-    precision: float
-    recall: float
-    f1: float
-    exact_match_rate: float
+    avg_gt_similarity: float
+    avg_pred_similarity: float
+    similarity_f1: float
+    gt_match_rate: float
+    pred_match_rate: float
+    similarity_threshold: float
     total_truth: int
     total_predicted: int
-    true_positive: int
-    false_positive: int
-    false_negative: int
-    level1_accuracy: float
-    level1_support: int
-    level2_accuracy: float
-    level2_support: int
-    checked_accuracy: float
-    checked_support: int
-    rule_name_accuracy: float
-    rule_name_support: int
     latency_ms: float
     avg_confidence: float
 
@@ -196,6 +188,21 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().lower()
 
 
+def normalize_similarity_text(text: str) -> str:
+    normalized = normalize_text(text)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized).strip()
+
+
+def text_similarity(a: str, b: str) -> float:
+    left = normalize_similarity_text(a)
+    right = normalize_similarity_text(b)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
 def normalize_filename(name: str) -> str:
     if not name:
         return ""
@@ -274,6 +281,12 @@ def compliance_rows_to_records(
     by_alias: bool = True,
 ) -> List[Dict[str, str]]:
     return [model_dump_safe(row, by_alias=by_alias) for row in rows]
+
+
+SIMILARITY_FIELDS: Tuple[str, ...] = (
+    "error_description",
+    "rule_name",
+)
 
 
 def _copy_compliance_row(row: ComplianceRow, **updates: str) -> ComplianceRow:
@@ -819,110 +832,88 @@ def compute_compliance_metrics(
     latency_ms: float,
     avg_confidence: float = 0.0,
     all_filenames: Optional[Iterable[str]] = None,
+    similarity_threshold: float = 0.7,
+    similarity_fields: Optional[Sequence[str]] = None,
 ) -> ComplianceMetrics:
-    def build_key(row: ComplianceRow) -> Optional[Tuple[str, str]]:
-        filename = normalize_filename(row.filename)
-        error_id = normalize_error_id(row.error_id)
-        if not filename and not error_id:
-            return None
-        return (filename, error_id)
+    fields = tuple(similarity_fields or SIMILARITY_FIELDS)
 
-    pred_counter: Counter = Counter()
-    truth_counter: Counter = Counter()
-    pred_map: Dict[Tuple[str, str], ComplianceRow] = {}
-    truth_map: Dict[Tuple[str, str], ComplianceRow] = {}
+    def row_text(row: ComplianceRow) -> str:
+        parts = [getattr(row, field, "") for field in fields]
+        return " ".join(str(part) for part in parts if part)
 
-    for row in predicted_rows:
-        key = build_key(row)
-        if key is None:
-            continue
-        pred_counter[key] += 1
-        pred_map.setdefault(key, row)
-
-    for row in ground_truth_rows:
-        key = build_key(row)
-        if key is None:
-            continue
-        truth_counter[key] += 1
-        truth_map.setdefault(key, row)
-
-    tp = sum((pred_counter & truth_counter).values())
-    fp = sum((pred_counter - truth_counter).values())
-    fn = sum((truth_counter - pred_counter).values())
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-
-    matched_keys = set(pred_map) & set(truth_map)
-
-    def field_accuracy(field: str, normalizer) -> Tuple[float, int]:
-        total = 0
-        correct = 0
-        for key in matched_keys:
-            pred_value = normalizer(getattr(pred_map[key], field))
-            truth_value = normalizer(getattr(truth_map[key], field))
-            if not pred_value or not truth_value:
-                continue
-            total += 1
-            if pred_value == truth_value:
-                correct += 1
-        return (correct / total if total else 0.0, total)
-
-    level1_acc, level1_support = field_accuracy("level1", normalize_label)
-    level2_acc, level2_support = field_accuracy("level2", normalize_label)
-    checked_acc, checked_support = field_accuracy("checked", normalize_checked)
-    rule_name_acc, rule_name_support = field_accuracy("rule_name", normalize_label)
-
-    pred_by_file: Dict[str, set] = defaultdict(set)
-    truth_by_file: Dict[str, set] = defaultdict(set)
+    pred_by_file: Dict[str, List[ComplianceRow]] = defaultdict(list)
+    truth_by_file: Dict[str, List[ComplianceRow]] = defaultdict(list)
 
     for row in predicted_rows:
         filename = normalize_filename(row.filename)
-        error_id = normalize_error_id(row.error_id)
-        if not filename or not error_id:
+        if not filename:
             continue
-        pred_by_file[filename].add(error_id)
+        pred_by_file[filename].append(row)
 
     for row in ground_truth_rows:
         filename = normalize_filename(row.filename)
-        error_id = normalize_error_id(row.error_id)
-        if not filename or not error_id:
+        if not filename:
             continue
-        truth_by_file[filename].add(error_id)
+        truth_by_file[filename].append(row)
 
     if all_filenames is None:
         file_names = set(pred_by_file) | set(truth_by_file)
     else:
         file_names = {normalize_filename(name) for name in all_filenames if name}
 
-    if not file_names:
-        exact_match_rate = 0.0
-    else:
-        matches = 0
-        for name in file_names:
-            if pred_by_file.get(name, set()) == truth_by_file.get(name, set()):
-                matches += 1
-        exact_match_rate = matches / len(file_names)
+    gt_similarities: List[float] = []
+    pred_similarities: List[float] = []
+    gt_matches = 0
+    pred_matches = 0
+
+    for name in file_names:
+        preds = pred_by_file.get(name, [])
+        truths = truth_by_file.get(name, [])
+
+        for truth in truths:
+            if not preds:
+                best = 0.0
+            else:
+                truth_text = row_text(truth)
+                best = max(text_similarity(row_text(pred), truth_text) for pred in preds)
+            gt_similarities.append(best)
+            if best >= similarity_threshold:
+                gt_matches += 1
+
+        for pred in preds:
+            if not truths:
+                best = 0.0
+            else:
+                pred_text = row_text(pred)
+                best = max(text_similarity(pred_text, row_text(truth)) for truth in truths)
+            pred_similarities.append(best)
+            if best >= similarity_threshold:
+                pred_matches += 1
+
+    avg_gt_similarity = (
+        sum(gt_similarities) / len(gt_similarities) if gt_similarities else 0.0
+    )
+    avg_pred_similarity = (
+        sum(pred_similarities) / len(pred_similarities) if pred_similarities else 0.0
+    )
+    similarity_f1 = (
+        2 * avg_gt_similarity * avg_pred_similarity / (avg_gt_similarity + avg_pred_similarity)
+        if avg_gt_similarity + avg_pred_similarity
+        else 0.0
+    )
+    gt_match_rate = gt_matches / len(gt_similarities) if gt_similarities else 0.0
+    pred_match_rate = pred_matches / len(pred_similarities) if pred_similarities else 0.0
 
     return ComplianceMetrics(
         strategy=strategy,
-        precision=precision,
-        recall=recall,
-        f1=f1,
-        exact_match_rate=exact_match_rate,
-        total_truth=sum(truth_counter.values()),
-        total_predicted=sum(pred_counter.values()),
-        true_positive=tp,
-        false_positive=fp,
-        false_negative=fn,
-        level1_accuracy=level1_acc,
-        level1_support=level1_support,
-        level2_accuracy=level2_acc,
-        level2_support=level2_support,
-        checked_accuracy=checked_acc,
-        checked_support=checked_support,
-        rule_name_accuracy=rule_name_acc,
-        rule_name_support=rule_name_support,
+        avg_gt_similarity=avg_gt_similarity,
+        avg_pred_similarity=avg_pred_similarity,
+        similarity_f1=similarity_f1,
+        gt_match_rate=gt_match_rate,
+        pred_match_rate=pred_match_rate,
+        similarity_threshold=similarity_threshold,
+        total_truth=len(gt_similarities),
+        total_predicted=len(pred_similarities),
         latency_ms=latency_ms,
         avg_confidence=avg_confidence,
     )
