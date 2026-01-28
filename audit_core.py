@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 from collections import defaultdict
-import difflib
 import hashlib
 import json
 import os
@@ -84,6 +83,7 @@ class ComplianceMetrics(BaseModel):
     gt_match_rate: float
     pred_match_rate: float
     similarity_threshold: float
+    similarity_model: str
     total_truth: int
     total_predicted: int
     latency_ms: float
@@ -193,14 +193,12 @@ def normalize_similarity_text(text: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized).strip()
 
 
-def text_similarity(a: str, b: str) -> float:
-    left = normalize_similarity_text(a)
-    right = normalize_similarity_text(b)
-    if not left or not right:
-        return 0.0
-    if left == right:
-        return 1.0
-    return difflib.SequenceMatcher(None, left, right).ratio()
+def similarity_model_name(embedder: Optional[EmbeddingProvider]) -> str:
+    if embedder is None:
+        return "hash-embedding"
+    if embedder.client is None:
+        return "hash-embedding"
+    return embedder.model or "hash-embedding"
 
 
 def normalize_filename(name: str) -> str:
@@ -287,6 +285,30 @@ SIMILARITY_FIELDS: Tuple[str, ...] = (
     "error_description",
     "rule_name",
 )
+
+
+def build_similarity_text(row: ComplianceRow, fields: Sequence[str]) -> str:
+    parts = [getattr(row, field, "") for field in fields]
+    combined = " ".join(str(part) for part in parts if part)
+    return normalize_similarity_text(combined)
+
+
+def best_match_similarities(
+    source_texts: Sequence[str],
+    target_texts: Sequence[str],
+    embedder: EmbeddingProvider,
+) -> List[float]:
+    if not source_texts:
+        return []
+    if not target_texts:
+        return [0.0 for _ in source_texts]
+    source_vectors = embedder.embed_texts(source_texts)
+    target_vectors = embedder.embed_texts(target_texts)
+    scores: List[float] = []
+    for source_vec in source_vectors:
+        best = max(cosine_similarity(source_vec, target_vec) for target_vec in target_vectors)
+        scores.append(best)
+    return scores
 
 
 def _copy_compliance_row(row: ComplianceRow, **updates: str) -> ComplianceRow:
@@ -834,12 +856,10 @@ def compute_compliance_metrics(
     all_filenames: Optional[Iterable[str]] = None,
     similarity_threshold: float = 0.7,
     similarity_fields: Optional[Sequence[str]] = None,
+    embedder: Optional[EmbeddingProvider] = None,
 ) -> ComplianceMetrics:
     fields = tuple(similarity_fields or SIMILARITY_FIELDS)
-
-    def row_text(row: ComplianceRow) -> str:
-        parts = [getattr(row, field, "") for field in fields]
-        return " ".join(str(part) for part in parts if part)
+    active_embedder = embedder or EmbeddingProvider(None, "hash-embedding")
 
     pred_by_file: Dict[str, List[ComplianceRow]] = defaultdict(list)
     truth_by_file: Dict[str, List[ComplianceRow]] = defaultdict(list)
@@ -870,24 +890,20 @@ def compute_compliance_metrics(
         preds = pred_by_file.get(name, [])
         truths = truth_by_file.get(name, [])
 
-        for truth in truths:
-            if not preds:
-                best = 0.0
-            else:
-                truth_text = row_text(truth)
-                best = max(text_similarity(row_text(pred), truth_text) for pred in preds)
-            gt_similarities.append(best)
-            if best >= similarity_threshold:
+        pred_texts = [build_similarity_text(row, fields) for row in preds]
+        truth_texts = [build_similarity_text(row, fields) for row in truths]
+
+        truth_scores = best_match_similarities(truth_texts, pred_texts, active_embedder)
+        pred_scores = best_match_similarities(pred_texts, truth_texts, active_embedder)
+
+        for score in truth_scores:
+            gt_similarities.append(score)
+            if score >= similarity_threshold:
                 gt_matches += 1
 
-        for pred in preds:
-            if not truths:
-                best = 0.0
-            else:
-                pred_text = row_text(pred)
-                best = max(text_similarity(pred_text, row_text(truth)) for truth in truths)
-            pred_similarities.append(best)
-            if best >= similarity_threshold:
+        for score in pred_scores:
+            pred_similarities.append(score)
+            if score >= similarity_threshold:
                 pred_matches += 1
 
     avg_gt_similarity = (
@@ -912,6 +928,7 @@ def compute_compliance_metrics(
         gt_match_rate=gt_match_rate,
         pred_match_rate=pred_match_rate,
         similarity_threshold=similarity_threshold,
+        similarity_model=similarity_model_name(active_embedder),
         total_truth=len(gt_similarities),
         total_predicted=len(pred_similarities),
         latency_ms=latency_ms,

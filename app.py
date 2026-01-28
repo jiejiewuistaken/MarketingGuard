@@ -318,6 +318,7 @@ if "audit_results" in st.session_state and image_files:
                     latency_ms=latency_ms,
                     avg_confidence=avg_conf,
                     all_filenames=poster_names,
+                    embedder=EmbeddingProvider(comparison_client, embedding_model),
                 )
             )
         metrics_df = pd.DataFrame([model_dump_safe(m) for m in metrics])

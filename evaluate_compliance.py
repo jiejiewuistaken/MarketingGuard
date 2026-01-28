@@ -8,6 +8,8 @@ import pandas as pd
 from audit_core import (
     ComplianceMetrics,
     ComplianceRow,
+    EmbeddingProvider,
+    build_openai_client,
     coerce_compliance_rows,
     compute_compliance_metrics,
     explode_compliance_rows,
@@ -49,9 +51,16 @@ def run_eval(
     all_filenames: Optional[Iterable[str]] = None,
     similarity_threshold: float = 0.7,
     similarity_fields: Optional[Iterable[str]] = None,
+    embedding_model: str = "text-embedding-3-small",
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> ComplianceMetrics:
     predicted_rows = load_rows(predictions_path)
     ground_truth_rows = load_rows(ground_truth_path)
+    client = None
+    if api_key or base_url:
+        client = build_openai_client(api_key=api_key, base_url=base_url)
+    embedder = EmbeddingProvider(client, embedding_model)
     return compute_compliance_metrics(
         predicted_rows=predicted_rows,
         ground_truth_rows=ground_truth_rows,
@@ -61,6 +70,7 @@ def run_eval(
         all_filenames=all_filenames,
         similarity_threshold=similarity_threshold,
         similarity_fields=tuple(similarity_fields) if similarity_fields else None,
+        embedder=embedder,
     )
 
 
@@ -86,6 +96,13 @@ def main() -> None:
         "--similarity-fields",
         help="Comma-separated fields (e.g. error_description,rule_name)",
     )
+    parser.add_argument(
+        "--embedding-model",
+        default=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        help="Embedding model name",
+    )
+    parser.add_argument("--embedding-api-key", default=os.getenv("OPENAI_API_KEY", ""))
+    parser.add_argument("--embedding-base-url", default=os.getenv("OPENAI_BASE_URL", ""))
     args = parser.parse_args()
 
     all_filenames = None
@@ -107,6 +124,9 @@ def main() -> None:
         all_filenames=all_filenames,
         similarity_threshold=args.similarity_threshold,
         similarity_fields=similarity_fields,
+        embedding_model=args.embedding_model,
+        api_key=args.embedding_api_key or None,
+        base_url=args.embedding_base_url or None,
     )
     print(json.dumps(model_dump_safe(metrics), ensure_ascii=False, indent=2))
 

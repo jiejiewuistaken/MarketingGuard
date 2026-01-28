@@ -62,13 +62,16 @@ Metrics are similarity-based (LLM generation friendly):
 - similarity_f1: harmonic mean of the two
 - gt_match_rate / pred_match_rate: fraction above threshold (default 0.7)
 
-Similarity uses `错误描述 + 合规规则名称` by default. Filenames are normalized by
-stem. You can customize fields/threshold via CLI:
+Similarity is computed from embeddings (cosine similarity). Default fields:
+`错误描述 + 合规规则名称`. Filenames are normalized by stem. You can customize
+fields/threshold/model via CLI:
 
 ```bash
 python evaluate_compliance.py \
   --predictions predictions.csv \
   --ground-truth ground_truth.xlsx \
   --similarity-threshold 0.75 \
-  --similarity-fields error_description,rule_name,level1
+  --similarity-fields error_description,rule_name,level1 \
+  --embedding-model text-embedding-3-small \
+  --embedding-api-key "$OPENAI_API_KEY"
 ```
