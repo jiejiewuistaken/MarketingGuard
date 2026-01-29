@@ -1,0 +1,22 @@
+{
+  "strategy": "offline_eval",
+  "precision": 0.0,
+  "recall": 0.0,
+  "f1": 0.0,
+  "exact_match_rate": 0.0,
+  "total_truth": 25,
+  "total_predicted": 2,
+  "true_positive": 0,
+  "false_positive": 2,
+  "false_negative": 25,
+  "level1_accuracy": 0.0,
+  "level1_support": 0,
+  "level2_accuracy": 0.0,
+  "level2_support": 0,
+  "checked_accuracy": 0.0,
+  "checked_support": 0,
+  "rule_name_accuracy": 0.0,
+  "rule_name_support": 0,
+  "latency_ms": 0.0,
+  "avg_confidence": 0.0
+}
