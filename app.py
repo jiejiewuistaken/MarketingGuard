@@ -148,6 +148,7 @@ ocr_files = st.file_uploader(
     "上传OCR文本 (MD/TXT)", type=["md", "txt"], accept_multiple_files=True
 )
 
+rule_index = st.session_state.get("rule_index")
 run_button = st.button("Run audit")
 
 if run_button:
@@ -174,6 +175,7 @@ if run_button:
         embedder = EmbeddingProvider(client, embedding_model)
         rule_index = RuleIndex(parsed_rules, embedder, cache_path=cache_path)
         rule_index.build()
+    st.session_state["rule_index"] = rule_index
 
     ocr_map = load_ocr_texts(ocr_files)
 
