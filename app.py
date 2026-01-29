@@ -110,13 +110,22 @@ with st.sidebar:
     embedding_model = st.text_input(
         "Embedding model", value=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
     )
-    use_rag = st.checkbox("Use RAG (hybrid recall)", value=True)
-    strategy = st.selectbox("Strategy", ["rule_vlm", "rule_only", "llm_only"], index=0)
+    strategy_labels = {
+        "baseline": "baseline（全量规则入prompt）",
+        "rag": "rag（召回相关规则）",
+        "advanced_rag": "advanced rag（metadata过滤 + 多query）",
+    }
+    strategy = st.selectbox(
+        "Strategy",
+        list(strategy_labels.keys()),
+        index=0,
+        format_func=strategy_labels.get,
+    )
     cache_dir = st.text_input("Rule index cache dir", value=".cache")
 
     st.divider()
     st.subheader("Rules")
-    rules_file = st.file_uploader("Upload rules (.txt/.md)", type=["txt", "md"])
+    rules_file = st.file_uploader("Upload rules (.txt/.md/.json)", type=["txt", "md", "json"])
     rules_text = st.text_area(
         "Or paste rules here",
         value="Rule 1. Do not promise returns or guarantee principal.",
@@ -149,15 +158,13 @@ if run_button:
 
     extra_headers = parse_extra_headers(extra_headers_raw)
 # 初始化openai客户端
-    client = None
-    if strategy != "rule_only":
-        if not api_key:
-            st.error("OPENAI_API_KEY is required for LLM strategies.")
-            st.stop()
-        client = build_openai_client(api_key=api_key, base_url=base_url)
-# 构建规则索引（使用/不使用/advanced RAG）
+    if not api_key:
+        st.error("OPENAI_API_KEY is required for LLM strategies.")
+        st.stop()
+    client = build_openai_client(api_key=api_key, base_url=base_url)
+# 构建规则索引（RAG/advanced RAG）
     rule_index = None
-    if use_rag or strategy == "llm_only":
+    if strategy in {"rag", "advanced_rag"}:
         cache_path = os.path.join(cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json")
         embedder = EmbeddingProvider(client, embedding_model)
         rule_index = RuleIndex(parsed_rules, embedder, cache_path=cache_path)
@@ -181,7 +188,6 @@ if run_button:
             model=vlm_model,
             extra_headers=extra_headers,
             strategy=strategy,
-            use_rag=use_rag,
             rule_index=rule_index,
             query_hint=None,
         )
@@ -248,7 +254,7 @@ if "audit_results" in st.session_state and image_files:
 
     st.divider()
     st.subheader("Comparison runner")
-    st.caption("Run baseline comparisons: rule-only, LLM-only, and rule+VLM.")
+    st.caption("Run baseline comparisons: baseline, rag, and advanced rag.")
     gt_file = st.file_uploader("Upload ground truth (CSV/XLSX)", type=["csv", "xlsx"])
     confirm_run = st.checkbox("Confirm running comparison")
     if st.button("Run comparison") and confirm_run:
@@ -271,7 +277,7 @@ if "audit_results" in st.session_state and image_files:
             comparison_index.build()
 
         metrics: List[ComplianceMetrics] = []
-        for mode in ["rule_only", "llm_only", "rule_vlm"]:
+        for mode in ["baseline", "rag", "advanced_rag"]:
             start = time.time()
             predictions: List[AuditResult] = []
             for image_file in image_files:
@@ -284,11 +290,10 @@ if "audit_results" in st.session_state and image_files:
                         image_mime=image_file.type,
                         ocr_text=ocr_text,
                         rules=comparison_rules,
-                        client=comparison_client if mode != "rule_only" else None,
+                        client=comparison_client,
                         model=vlm_model,
                         extra_headers=extra_headers,
                         strategy=mode,
-                        use_rag=use_rag,
                         rule_index=comparison_index,
                         query_hint=None,
                     )
