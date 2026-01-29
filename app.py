@@ -91,7 +91,12 @@ def render_confidence_bars(results: Dict[str, AuditResult]) -> None:
     st.markdown("**Poster confidence bars**")
     for name, result in results.items():
         st.caption(name)
-        st.progress(int(result.overall_confidence * 100))
+        score = int(result.overall_confidence * 100)
+        bar_col, value_col = st.columns([6, 1])
+        with bar_col:
+            st.progress(score)
+        with value_col:
+            st.markdown(f"**{score}%**")
 
 
 st.title("MarketingGuard Audit Assistant")
