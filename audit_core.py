@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import time
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
@@ -22,7 +21,8 @@ class Rule(BaseModel):
     rule_id: str
     text: str
     keywords: List[str] = Field(default_factory=list)
-    tags: List[str] = Field(default_factory=list)
+    categories: List[str] = Field(default_factory=list)
+    trigger_keywords: List[str] = Field(default_factory=list)
     metadata: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -44,6 +44,9 @@ class AuditResult(BaseModel):
     overall_confidence: float
     summary: str
     violations: List[Violation] = Field(default_factory=list)
+    audit_steps: List[str] = Field(default_factory=list)
+    poster_tags: List[str] = Field(default_factory=list)
+    image_description: str = ""
 
 
 class ComplianceRow(BaseModel):
@@ -107,6 +110,18 @@ class RetrievalPlan(BaseModel):
     tags: List[str] = Field(default_factory=list)
 
 
+class ImageDescription(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = ""
+
+
+class PosterTags(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tags: List[str] = Field(default_factory=list)
+
+
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
@@ -154,7 +169,8 @@ def parse_rules_payload(payload: Any) -> List[Rule]:
         rule_id = f"R{idx:03d}"
         text = ""
         metadata: Dict[str, str] = {}
-        tags: List[str] = []
+        categories: List[str] = []
+        trigger_keywords: List[str] = []
         if isinstance(record, str):
             text = record
         elif isinstance(record, dict):
@@ -166,11 +182,16 @@ def parse_rules_payload(payload: Any) -> List[Rule]:
                 or ""
             )
             rule_id = normalize_rule_id(record.get("rule_id") or record.get("id") or record.get("error_id"), rule_id)
-            raw_tags = record.get("tags")
-            if isinstance(raw_tags, list):
-                tags = [str(value) for value in raw_tags if value]
-            elif isinstance(raw_tags, str):
-                tags = [part for part in re.split(r"[;,，、]", raw_tags) if part.strip()]
+            raw_categories = record.get("category") or record.get("categories") or record.get("tags")
+            if isinstance(raw_categories, list):
+                categories = [str(value) for value in raw_categories if value]
+            elif isinstance(raw_categories, str):
+                categories = [part for part in re.split(r"[;,，、]", raw_categories) if part.strip()]
+            raw_triggers = record.get("trigger_keywords") or record.get("keywords")
+            if isinstance(raw_triggers, list):
+                trigger_keywords = [str(value) for value in raw_triggers if value]
+            elif isinstance(raw_triggers, str):
+                trigger_keywords = [part for part in re.split(r"[;,，、]", raw_triggers) if part.strip()]
             for key in ("description", "category", "source", "level1", "level2"):
                 if key in record and record[key] not in (None, ""):
                     metadata[key] = str(record[key])
@@ -180,8 +201,10 @@ def parse_rules_payload(payload: Any) -> List[Rule]:
         if not text:
             continue
         rule = Rule(rule_id=rule_id, text=text, metadata=metadata)
-        if tags:
-            rule.tags = normalize_tags(tags)
+        if categories:
+            rule.categories = normalize_categories(categories)
+        if trigger_keywords:
+            rule.trigger_keywords = trigger_keywords
         annotate_rule(rule)
         rules.append(rule)
     return rules
@@ -240,6 +263,19 @@ def parse_rules(raw_text: str) -> List[Rule]:
     return rules
 
 
+def rule_to_structured_record(rule: Rule) -> Dict[str, object]:
+    return {
+        "id": rule.rule_id,
+        "category": rule.categories or ["通用"],
+        "text": rule.text,
+        "trigger_keywords": rule.trigger_keywords or rule.keywords,
+    }
+
+
+def rules_to_structured_payload(rules: Sequence[Rule]) -> List[Dict[str, object]]:
+    return [rule_to_structured_record(rule) for rule in rules]
+
+
 def extract_keywords(text: str) -> List[str]:
     tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text)
     stopwords = {
@@ -268,101 +304,115 @@ def extract_keywords(text: str) -> List[str]:
     return sorted(set(keywords))
 
 
-TAG_KEYWORDS: Dict[str, Sequence[str]] = {
-    "performance": ["业绩", "收益率", "回报", "年化", "收益", "涨幅", "超额收益"],
-    "ranking": ["排名", "名列", "前列", "位居", "第一", "冠军", "唯一"],
-    "awards": ["奖项", "获奖", "荣获"],
-    "risk_disclosure": ["风险", "提示", "不预示", "不作为", "投资建议", "保证", "承诺"],
-    "etf": ["etf", "交易型开放式", "etf基金"],
-    "index": ["指数", "中证", "沪深", "深证", "国证", "指数基金"],
-    "dividend": ["分红", "红利", "派息", "收益分配"],
-    "fund_manager": ["基金经理", "投研", "投资年限", "管理经验"],
-    "fees": ["费率", "费用", "赎回费", "管理费", "销售服务费"],
-    "sales_listing": ["发售", "发行", "募集", "上市", "上市日期", "发售日期"],
-    "guarantee": ["保本", "本金", "保证收益", "承诺收益", "收益保证"],
-    "superlative": ["最大", "最强", "最高", "唯一", "第一", "领先", "顶级"],
-    "bond": ["债券", "短债", "中债"],
+CATEGORY_KEYWORDS: Dict[str, Sequence[str]] = {
+    "ETF": ["etf", "交易型开放式", "etf基金"],
+    "指数基金": ["指数基金", "指数", "中证", "沪深", "深证", "国证"],
+    "股票型基金": ["股票型", "股票基金", "权益"],
+    "货币型基金": ["货币基金", "货币型"],
+    "债券基金": ["债券", "短债", "债基", "中债"],
+    "宣传单页": ["宣传单页", "一页通", "单页"],
+    "朋友圈海报": ["朋友圈", "微信", "社交媒体"],
+    "含有历史业绩": ["业绩", "收益率", "回报", "年化", "收益", "涨幅", "超额收益"],
+    "含有排名": ["排名", "名列", "前列", "位居", "第一", "冠军", "唯一"],
+    "含有奖项": ["奖项", "获奖", "荣获"],
+    "含有分红": ["分红", "红利", "派息", "收益分配"],
+    "含有费用": ["费率", "费用", "赎回费", "管理费", "销售服务费"],
+    "含有风险提示": ["风险", "提示", "不预示", "不作为", "投资建议", "保证", "承诺"],
+    "基金经理": ["基金经理", "投研", "投资年限", "管理经验"],
+    "募集发行": ["发售", "发行", "募集"],
+    "上市": ["上市", "挂牌", "上市日期"],
+    "通用": [],
 }
 
-TAG_DESCRIPTIONS: Dict[str, str] = {
-    "performance": "业绩/收益率/回报",
-    "ranking": "排名/前列/第一",
-    "awards": "奖项/获奖",
-    "risk_disclosure": "风险提示/免责声明",
-    "etf": "ETF相关",
-    "index": "指数/指数基金",
-    "dividend": "分红/收益分配",
-    "fund_manager": "基金经理/投研年限",
-    "fees": "费率/费用/赎回费",
-    "sales_listing": "发售/上市/募集",
-    "guarantee": "保本/收益保证/承诺",
-    "superlative": "最高级/唯一/领先",
-    "bond": "债券/短债",
+CATEGORY_DESCRIPTIONS: Dict[str, str] = {
+    "ETF": "ETF/交易型开放式",
+    "指数基金": "指数/指数基金",
+    "股票型基金": "股票型/权益类",
+    "货币型基金": "货币基金/现金管理",
+    "债券基金": "债券/短债/债基",
+    "宣传单页": "宣传单页/一页通",
+    "朋友圈海报": "朋友圈/社交媒体",
+    "含有历史业绩": "业绩/收益率/回报",
+    "含有排名": "排名/前列/第一",
+    "含有奖项": "奖项/获奖",
+    "含有分红": "分红/收益分配",
+    "含有费用": "费率/费用/赎回费",
+    "含有风险提示": "风险提示/免责声明",
+    "基金经理": "基金经理/投研年限",
+    "募集发行": "募集/发行/发售",
+    "上市": "上市/挂牌",
+    "通用": "通用规则",
 }
 
-TAG_ALIASES: Dict[str, str] = {
-    "业绩": "performance",
-    "收益": "performance",
-    "收益率": "performance",
-    "排名": "ranking",
-    "奖项": "awards",
-    "获奖": "awards",
-    "风险": "risk_disclosure",
-    "风险提示": "risk_disclosure",
-    "etf": "etf",
-    "指数": "index",
-    "分红": "dividend",
-    "费用": "fees",
-    "费率": "fees",
-    "基金经理": "fund_manager",
-    "发售": "sales_listing",
-    "上市": "sales_listing",
-    "募集": "sales_listing",
-    "保本": "guarantee",
-    "收益保证": "guarantee",
-    "最高级": "superlative",
-    "债券": "bond",
+CATEGORY_ALIASES: Dict[str, str] = {
+    "etf": "ETF",
+    "etf基金": "ETF",
+    "指数": "指数基金",
+    "股票基金": "股票型基金",
+    "货币基金": "货币型基金",
+    "债基": "债券基金",
+    "历史业绩": "含有历史业绩",
+    "业绩": "含有历史业绩",
+    "排名": "含有排名",
+    "奖项": "含有奖项",
+    "分红": "含有分红",
+    "费用": "含有费用",
+    "风险": "含有风险提示",
+    "宣传单页": "宣传单页",
+    "朋友圈": "朋友圈海报",
+    "募集": "募集发行",
+    "发售": "募集发行",
+    "发行": "募集发行",
 }
 
 
-def normalize_tags(tags: Iterable[str]) -> List[str]:
-    allowed = set(TAG_KEYWORDS.keys())
+def normalize_categories(categories: Iterable[str], include_default: bool = False) -> List[str]:
+    allowed = set(CATEGORY_KEYWORDS.keys())
     normalized: List[str] = []
-    for tag in tags:
-        if tag is None:
+    for category in categories:
+        if category is None:
             continue
-        cleaned = normalize_text(str(tag))
+        cleaned = normalize_text(str(category))
         if not cleaned:
             continue
         cleaned = cleaned.split("=", 1)[0].strip()
         cleaned = re.sub(r"[()（）].*", "", cleaned).strip()
-        cleaned = cleaned.replace(" ", "_")
-        cleaned = TAG_ALIASES.get(cleaned, cleaned)
+        cleaned = cleaned.replace(" ", "")
+        cleaned = CATEGORY_ALIASES.get(cleaned, cleaned)
         if cleaned in allowed:
             normalized.append(cleaned)
+    if include_default and "通用" not in normalized:
+        normalized.append("通用")
     return sorted(set(normalized))
 
 
-def derive_tags(text: str) -> List[str]:
+def derive_categories(text: str) -> List[str]:
     normalized = normalize_text(text)
-    tags: List[str] = []
-    for tag, keywords in TAG_KEYWORDS.items():
+    categories: List[str] = []
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if not keywords:
+            continue
         for keyword in keywords:
             if normalize_text(keyword) in normalized:
-                tags.append(tag)
+                categories.append(category)
                 break
-    return sorted(set(tags))
+    return sorted(set(categories))
 
 
 def annotate_rule(rule: Rule) -> Rule:
     if not rule.keywords:
         rule.keywords = extract_keywords(rule.text)
+    if not rule.trigger_keywords:
+        rule.trigger_keywords = list(rule.keywords)
     metadata_text = " ".join(rule.metadata.values()) if rule.metadata else ""
-    derived = derive_tags(f"{rule.text} {metadata_text}".strip())
-    if rule.tags:
-        rule.tags = normalize_tags(rule.tags) or derived
+    derived = derive_categories(f"{rule.text} {metadata_text}".strip())
+    normalized = normalize_categories(rule.categories, include_default=False)
+    if normalized:
+        rule.categories = normalized
+    elif derived:
+        rule.categories = derived
     else:
-        rule.tags = derived
+        rule.categories = ["通用"]
     return rule
 
 
@@ -597,8 +647,9 @@ def keyword_recall(rules: Sequence[Rule], query: str) -> List[Rule]:
     matches: List[Rule] = []
     normalized = normalize_text(query)
     for rule in rules:
-        for keyword in rule.keywords:
-            if keyword in normalized:
+        for keyword in (rule.trigger_keywords or rule.keywords):
+            normalized_keyword = normalize_text(keyword)
+            if normalized_keyword and normalized_keyword in normalized:
                 matches.append(rule)
                 break
     return matches
@@ -652,11 +703,12 @@ def base_query_variants(text_query: str) -> List[str]:
     return normalize_queries(queries)
 
 
-def filter_rules_by_tags(rules: Sequence[Rule], tags: Sequence[str]) -> List[Rule]:
-    normalized_tags = set(normalize_tags(tags))
-    if not normalized_tags:
+def filter_rules_by_categories(rules: Sequence[Rule], categories: Sequence[str]) -> List[Rule]:
+    normalized_base = normalize_categories(categories, include_default=False)
+    if not normalized_base or normalized_base == ["通用"]:
         return list(rules)
-    filtered = [rule for rule in rules if normalized_tags & set(rule.tags)]
+    normalized_categories = set(normalize_categories(categories, include_default=True))
+    filtered = [rule for rule in rules if normalized_categories & set(rule.categories)]
     return filtered or list(rules)
 
 
@@ -668,15 +720,15 @@ def build_retrieval_plan(
     max_queries: int = 4,
 ) -> RetrievalPlan:
     fallback_queries = base_query_variants(text_query)
-    fallback_tags = derive_tags(text_query)
+    fallback_tags = normalize_categories(derive_categories(text_query), include_default=True)
     fallback = RetrievalPlan(queries=fallback_queries, tags=fallback_tags)
     if client is None:
         return fallback
-    tag_hints = "; ".join(f"{tag}={desc}" for tag, desc in TAG_DESCRIPTIONS.items())
+    tag_hints = "; ".join(f"{tag}={desc}" for tag, desc in CATEGORY_DESCRIPTIONS.items())
     system_prompt = "你是合规规则检索规划器。输出JSON必须符合指定schema。"
     user_prompt = (
-        "请根据OCR文本生成用于检索合规规则的查询和标签。\n"
-        f"OCR text:\n{compact_text(text_query, max_chars=1200)}\n\n"
+        "请根据OCR文本与图像描述生成用于检索合规规则的查询和标签。\n"
+        f"OCR+图像描述:\n{compact_text(text_query, max_chars=1200)}\n\n"
         f"可用标签: {tag_hints}\n\n"
         f"任务:\n- 生成1-{max_queries}条检索查询(queries)，优先覆盖潜在违规点。\n"
         "- 选择相关标签(tags)，只能从可用标签中选择。\n"
@@ -694,8 +746,77 @@ def build_retrieval_plan(
     except Exception:
         return fallback
     plan.queries = normalize_queries(plan.queries or [])[:max_queries] or fallback.queries
-    plan.tags = normalize_tags(plan.tags or []) or fallback.tags
+    plan.tags = normalize_categories(plan.tags or [], include_default=True) or fallback.tags
     return plan
+
+
+def describe_image_with_llm(
+    client: Optional[OpenAI],
+    model: str,
+    extra_headers: Optional[Dict[str, str]],
+    image_bytes: Optional[bytes],
+    image_mime: str,
+) -> str:
+    if client is None or not image_bytes:
+        return ""
+    system_prompt = "你是基金海报图像描述助手，只输出简洁中文描述。"
+    user_prompt = "请描述海报中的关键信息、视觉元素与可能的合规风险线索。"
+    try:
+        result = call_openai_json(
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_data_url=encode_image_to_data_url(image_bytes, image_mime),
+            response_model=ImageDescription,
+            extra_headers=extra_headers,
+        )
+    except Exception:
+        return ""
+    return compact_text(getattr(result, "description", ""), max_chars=800)
+
+
+def classify_poster_tags(
+    client: Optional[OpenAI],
+    model: str,
+    extra_headers: Optional[Dict[str, str]],
+    ocr_text: str,
+    image_description: str,
+) -> List[str]:
+    combined = compact_text(f"{ocr_text}\n{image_description}".strip(), max_chars=1200)
+    fallback = normalize_categories(derive_categories(combined), include_default=True)
+    if client is None:
+        return fallback
+    tag_hints = "; ".join(f"{tag}={desc}" for tag, desc in CATEGORY_DESCRIPTIONS.items())
+    system_prompt = "你是海报类型分类器，只输出标签JSON。"
+    user_prompt = (
+        "根据OCR文本和图像描述识别海报类型标签。\n"
+        f"OCR+图像描述:\n{combined or '[EMPTY]'}\n\n"
+        f"可用标签: {tag_hints}\n\n"
+        "任务:\n- 输出与海报相关的tags列表。\n- 只从可用标签中选择。\n"
+    )
+    try:
+        result = call_openai_json(
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_data_url=None,
+            response_model=PosterTags,
+            extra_headers=extra_headers,
+        )
+    except Exception:
+        return fallback
+    tags = normalize_categories(getattr(result, "tags", []) or [], include_default=True)
+    return tags or fallback
+
+
+def lexical_recall_by_queries(rules: Sequence[Rule], queries: Sequence[str]) -> List[Rule]:
+    merged: Dict[str, Rule] = {}
+    for query in queries:
+        for rule in keyword_recall(rules, query):
+            merged.setdefault(rule.rule_id, rule)
+    return list(merged.values())
 
 
 def rag_recall(
@@ -729,7 +850,7 @@ def advanced_recall(
     if not query or rule_index is None:
         return list(rules)
     plan = build_retrieval_plan(query, client, model, extra_headers)
-    candidate_rules = filter_rules_by_tags(rules, plan.tags)
+    candidate_rules = filter_rules_by_categories(rules, plan.tags)
     allowed_ids = {rule.rule_id for rule in candidate_rules}
     merged: Dict[str, Rule] = {}
     for query_variant in plan.queries:
@@ -874,26 +995,65 @@ def call_openai_json(
     return model_validate_json_safe(response_model, payload)
 
 
+def generate_dynamic_cot_steps(rules: Sequence[Rule]) -> str:
+    steps: List[str] = []
+    steps.append("Step 1: **全局扫描** - 阅读OCR文本和图像描述，理解海报产品类型与核心宣传点。")
+    for index, rule in enumerate(rules, start=2):
+        content = rule.text
+        if any(keyword in content for keyword in ["禁止", "不得", "严禁", "不许"]):
+            action = (
+                f"仔细扫描文本和画面，检查是否存在违反【{rule.rule_id}】的表述（如“{content[:15]}...”）。"
+            )
+            logic = "这是一个【禁止项/Negative Check】。找到相关表述即判定为违规。"
+        elif any(keyword in content for keyword in ["必须", "须", "应", "包含"]):
+            action = f"检查文本中是否包含【{rule.rule_id}】要求的强制内容（{content[:15]}...）。"
+            logic = "这是一个【必备项/Positive Check】。缺失则判定为违规。"
+        else:
+            action = f"根据【{rule.rule_id}】要求对海报进行比对核查。"
+            logic = "根据规则描述判断合规性。"
+        steps.append(
+            "\n".join(
+                [
+                    f"Step {index}: **针对规则 {rule.rule_id} 的专项核查**",
+                    f"   - 规则要求: {content}",
+                    f"   - 执行动作: {action}",
+                    f"   - 判断逻辑: {logic}",
+                ]
+            )
+        )
+    steps.append(f"Step {len(rules) + 2}: **总结输出** - 汇总发现的问题并输出结构化JSON。")
+    return "\n\n".join(steps)
+
+
 def build_audit_prompts(
     poster_name: str,
     ocr_text: str,
+    image_description: str,
     rules: Sequence[Rule],
+    tags: Sequence[str],
     include_rules: bool,
+    cot_steps: str,
 ) -> Tuple[str, str]:
     system_prompt = (
-        "你是易方达基金营销材料的合规审查员。使用提供的规则来识别违规行为。输出的 JSON 必须严格符合指定的格式。保持证据简洁，并尽可能直接引用原文"
+        "你是易方达基金营销材料的合规审查员。使用提供的规则来识别违规行为。输出必须严格符合JSON schema。"
+        "不要输出冗长推理，仅给出简洁的检查步骤摘要。"
     )
     rules_block = format_rules(rules) if include_rules else "没有检查到规则"
+    tag_block = "，".join(tags) if tags else "未识别"
     user_prompt = (
         f"营销材料名称: {poster_name}\n\n"
         f"OCR text:\n{ocr_text or '[EMPTY]'}\n\n"
+        f"图像描述:\n{image_description or '[EMPTY]'}\n\n"
+        f"标签: {tag_block}\n\n"
         f"规则:\n{rules_block}\n\n"
+        f"思维链步骤（请在内部遵循该步骤，输出时只给audit_steps简要结论）:\n{cot_steps}\n\n"
         "任务:\n"
         "- 列出营销材料中所有违反规则的部分。\n"
         "- Each violation must cite a rule_id and include evidence.\n"
         "- 如果没有检查到违反规则的地方，返回一个空列表，并且compliant=true.\n"
         "- 提供一个0-1之间的总体置信度.\n"
         "- modality=text, image, or text+image.\n"
+        "- audit_steps输出简短检查要点列表，不要泄露完整推理。\n"
     )
     return system_prompt, user_prompt
 
@@ -915,7 +1075,7 @@ def normalize_audit_result(result: AuditResult, fallback_name: str) -> AuditResu
 def audit_rule_only(poster_name: str, ocr_text: str, rules: Sequence[Rule]) -> AuditResult:
     violations: List[Violation] = []
     for rule in rules:
-        evidence = find_keyword_evidence(ocr_text, rule.keywords)
+        evidence = find_keyword_evidence(ocr_text, rule.trigger_keywords or rule.keywords)
         if not evidence:
             continue
         violations.append(
@@ -949,7 +1109,7 @@ def map_violation_to_rule(
         return scored[0][0] if scored else None
     normalized = normalize_text(violation_text)
     for rule in rules:
-        for keyword in rule.keywords:
+        for keyword in (rule.trigger_keywords or rule.keywords):
             if keyword in normalized:
                 return rule
     return rules[0]
@@ -958,15 +1118,26 @@ def map_violation_to_rule(
 def audit_with_llm(
     poster_name: str,
     ocr_text: str,
+    image_description: str,
     rules: Sequence[Rule],
     client: OpenAI,
     model: str,
     extra_headers: Optional[Dict[str, str]],
+    tags: Sequence[str],
+    cot_steps: str,
     image_bytes: Optional[bytes] = None,
     image_mime: str = "image/png",
     include_rules: bool = True,
 ) -> AuditResult:
-    system_prompt, user_prompt = build_audit_prompts(poster_name, ocr_text, rules, include_rules)
+    system_prompt, user_prompt = build_audit_prompts(
+        poster_name=poster_name,
+        ocr_text=ocr_text,
+        image_description=image_description,
+        rules=rules,
+        tags=tags,
+        include_rules=include_rules,
+        cot_steps=cot_steps,
+    )
     image_data_url = None
     if image_bytes:
         image_data_url = encode_image_to_data_url(image_bytes, image_mime)
@@ -1018,35 +1189,57 @@ def run_audit(
     text_query = compact_text(" ".join([ocr_text or "", query_hint or ""]).strip(), max_chars=1200)
     if client is None:
         raise RuntimeError("OpenAI client is required for LLM strategies.")
-    if strategy == "baseline":
-        candidate_rules = list(rules)
-    elif strategy == "rag":
-        candidate_rules = rag_recall(
-            rules=rules,
-            rule_index=rule_index,
-            query=text_query,
-        )
-    else:
-        candidate_rules = advanced_recall(
-            rules=rules,
-            rule_index=rule_index,
-            query=text_query,
-            client=client,
-            model=model,
-            extra_headers=extra_headers,
-        )
-    include_rules = True
-    result = audit_with_llm(
-        poster_name=poster_name,
-        ocr_text=ocr_text,
-        rules=candidate_rules,
+
+    image_description = describe_image_with_llm(
         client=client,
         model=model,
         extra_headers=extra_headers,
         image_bytes=image_bytes,
         image_mime=image_mime,
-        include_rules=include_rules,
     )
+    tag_source = compact_text(" ".join([text_query, image_description]).strip(), max_chars=1200)
+    poster_tags = classify_poster_tags(
+        client=client,
+        model=model,
+        extra_headers=extra_headers,
+        ocr_text=ocr_text,
+        image_description=image_description,
+    )
+
+    if strategy == "baseline":
+        candidate_rules = list(rules)
+    elif strategy == "rag":
+        candidate_rules = filter_rules_by_categories(rules, poster_tags)
+    else:
+        plan = build_retrieval_plan(tag_source, client, model, extra_headers)
+        merged_tags = normalize_categories(list(set(poster_tags) | set(plan.tags)), include_default=True)
+        poster_tags = merged_tags or poster_tags
+        candidate_rules = filter_rules_by_categories(rules, poster_tags)
+        query_rules = lexical_recall_by_queries(candidate_rules, plan.queries)
+        if query_rules:
+            general_rules = [rule for rule in candidate_rules if "通用" in rule.categories]
+            merged: Dict[str, Rule] = {rule.rule_id: rule for rule in general_rules}
+            for rule in query_rules:
+                merged.setdefault(rule.rule_id, rule)
+            candidate_rules = list(merged.values())
+
+    cot_steps = generate_dynamic_cot_steps(candidate_rules)
+    result = audit_with_llm(
+        poster_name=poster_name,
+        ocr_text=ocr_text,
+        image_description=image_description,
+        rules=candidate_rules,
+        client=client,
+        model=model,
+        extra_headers=extra_headers,
+        tags=poster_tags,
+        cot_steps=cot_steps,
+        image_bytes=image_bytes,
+        image_mime=image_mime,
+        include_rules=True,
+    )
+    result.poster_tags = poster_tags
+    result.image_description = image_description
     return fill_rule_references(result, rules, rule_index)
 
 
