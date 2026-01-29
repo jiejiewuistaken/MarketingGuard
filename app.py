@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -14,8 +13,6 @@ from audit_core import (
     AuditResult,
     ComplianceMetrics,
     ComplianceRow,
-    EmbeddingProvider,
-    RuleIndex,
     build_openai_client,
     coerce_compliance_rows,
     compliance_rows_from_audit_results,
@@ -91,7 +88,12 @@ def render_confidence_bars(results: Dict[str, AuditResult]) -> None:
     st.markdown("**Poster confidence bars**")
     for name, result in results.items():
         st.caption(name)
-        st.progress(int(result.overall_confidence * 100))
+        score = int(result.overall_confidence * 100)
+        bar_col, value_col = st.columns([6, 1])
+        with bar_col:
+            st.progress(score)
+        with value_col:
+            st.markdown(f"**{score}%**")
 
 
 st.title("MarketingGuard Audit Assistant")
@@ -107,13 +109,10 @@ with st.sidebar:
         height=100,
     )
     vlm_model = st.text_input("VLM model", value=os.getenv("OPENAI_VLM_MODEL", "gpt-4o-mini"))
-    embedding_model = st.text_input(
-        "Embedding model", value=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-    )
     strategy_labels = {
         "baseline": "baseline（全量规则入prompt）",
-        "rag": "rag（召回相关规则）",
-        "advanced_rag": "advanced rag（metadata过滤 + 多query）",
+        "rag": "rag（Tagger + metadata过滤）",
+        "advanced_rag": "advanced rag（Tagger + 多query硬匹配）",
     }
     strategy = st.selectbox(
         "Strategy",
@@ -121,7 +120,6 @@ with st.sidebar:
         index=0,
         format_func=strategy_labels.get,
     )
-    cache_dir = st.text_input("Rule index cache dir", value=".cache")
 
     st.divider()
     st.subheader("Rules")
@@ -142,7 +140,6 @@ image_files = st.file_uploader(
 ocr_files = st.file_uploader(
     "上传OCR文本 (MD/TXT)", type=["md", "txt"], accept_multiple_files=True
 )
-
 run_button = st.button("Run audit")
 
 if run_button:
@@ -162,14 +159,6 @@ if run_button:
         st.error("OPENAI_API_KEY is required for LLM strategies.")
         st.stop()
     client = build_openai_client(api_key=api_key, base_url=base_url)
-# 构建规则索引（RAG/advanced RAG）
-    rule_index = None
-    if strategy in {"rag", "advanced_rag"}:
-        cache_path = os.path.join(cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json")
-        embedder = EmbeddingProvider(client, embedding_model)
-        rule_index = RuleIndex(parsed_rules, embedder, cache_path=cache_path)
-        rule_index.build()
-
     ocr_map = load_ocr_texts(ocr_files)
 
     results: Dict[str, AuditResult] = {}
@@ -188,7 +177,7 @@ if run_button:
             model=vlm_model,
             extra_headers=extra_headers,
             strategy=strategy,
-            rule_index=rule_index,
+            rule_index=None,
             query_hint=None,
         )
         latency_map[poster_name] = (time.time() - start) * 1000
@@ -224,13 +213,27 @@ if "audit_results" in st.session_state and image_files:
         ocr_text = ocr_map.get(Path(selected_name).stem, "")
         st.text_area("OCR output", value=ocr_text, height=240, key=f"ocr_{selected_name}")
 
-        st.subheader("Audit results")
         result = results.get(selected_name)
+        if result is not None:
+            st.subheader("Image description")
+            st.text_area(
+                "VLM description",
+                value=result.image_description or "",
+                height=140,
+                key=f"desc_{selected_name}",
+            )
+            tags = "，".join(result.poster_tags) if result.poster_tags else "未识别"
+            st.caption(f"Detected tags: {tags}")
+
+        st.subheader("Audit results")
         if result is None or not result.violations:
             st.info("No violations detected.")
         else:
             df = pd.DataFrame([model_dump_safe(v) for v in result.violations])
             st.dataframe(df, use_container_width=True)
+        if result is not None and result.audit_steps:
+            with st.expander("Audit steps (summary)"):
+                st.write("\n".join(result.audit_steps))
 
     st.divider()
     render_confidence_bars(results)
@@ -267,14 +270,6 @@ if "audit_results" in st.session_state and image_files:
         comparison_rules = parse_rules(rules_text)
         extra_headers = parse_extra_headers(extra_headers_raw)
         comparison_client = build_openai_client(api_key=api_key, base_url=base_url)
-        comparison_index = rule_index
-        if comparison_index is None:
-            cache_path = os.path.join(
-                cache_dir, f"rules_{hashlib.sha256(rules_text.encode()).hexdigest()}.json"
-            )
-            embedder = EmbeddingProvider(comparison_client, embedding_model)
-            comparison_index = RuleIndex(comparison_rules, embedder, cache_path=cache_path)
-            comparison_index.build()
 
         metrics: List[ComplianceMetrics] = []
         for mode in ["baseline", "rag", "advanced_rag"]:
@@ -294,7 +289,7 @@ if "audit_results" in st.session_state and image_files:
                         model=vlm_model,
                         extra_headers=extra_headers,
                         strategy=mode,
-                        rule_index=comparison_index,
+                        rule_index=None,
                         query_hint=None,
                     )
                 )
