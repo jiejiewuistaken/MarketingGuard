@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +22,8 @@ class Rule(BaseModel):
     rule_id: str
     text: str
     keywords: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, str] = Field(default_factory=dict)
 
 
 class Violation(BaseModel):
@@ -98,6 +100,13 @@ class ComplianceMetrics(BaseModel):
     avg_confidence: float
 
 
+class RetrievalPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    queries: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+
+
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
@@ -120,7 +129,78 @@ def model_dump_safe(model: BaseModel, **kwargs) -> Dict:
     return model.dict(**kwargs)
 
 
+def normalize_rule_id(value: Optional[str], fallback: str) -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    upper = text.upper()
+    if re.match(r"^R\d{1,4}$", upper):
+        return upper
+    digits = re.findall(r"\d+", text)
+    if digits:
+        return f"R{int(digits[0]):03d}"
+    return upper
+
+
+def parse_rules_payload(payload: Any) -> List[Rule]:
+    if isinstance(payload, dict) and "rules" in payload:
+        payload = payload["rules"]
+    if not isinstance(payload, list):
+        return []
+    rules: List[Rule] = []
+    for idx, record in enumerate(payload, start=1):
+        rule_id = f"R{idx:03d}"
+        text = ""
+        metadata: Dict[str, str] = {}
+        tags: List[str] = []
+        if isinstance(record, str):
+            text = record
+        elif isinstance(record, dict):
+            text = (
+                record.get("rule")
+                or record.get("text")
+                or record.get("rule_text")
+                or record.get("content")
+                or ""
+            )
+            rule_id = normalize_rule_id(record.get("rule_id") or record.get("id") or record.get("error_id"), rule_id)
+            raw_tags = record.get("tags")
+            if isinstance(raw_tags, list):
+                tags = [str(value) for value in raw_tags if value]
+            elif isinstance(raw_tags, str):
+                tags = [part for part in re.split(r"[;,，、]", raw_tags) if part.strip()]
+            for key in ("description", "category", "source", "level1", "level2"):
+                if key in record and record[key] not in (None, ""):
+                    metadata[key] = str(record[key])
+        else:
+            text = str(record)
+        text = str(text).strip()
+        if not text:
+            continue
+        rule = Rule(rule_id=rule_id, text=text, metadata=metadata)
+        if tags:
+            rule.tags = normalize_tags(tags)
+        annotate_rule(rule)
+        rules.append(rule)
+    return rules
+
+
 def parse_rules(raw_text: str) -> List[Rule]:
+    raw_text = raw_text or ""
+    stripped = raw_text.strip()
+    if not stripped:
+        return []
+    if stripped.startswith(("{", "[")):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if payload is not None:
+            parsed = parse_rules_payload(payload)
+            if parsed:
+                return parsed
     lines = [line.strip() for line in raw_text.splitlines()]
     rules: List[Rule] = []
     current_id: Optional[str] = None
@@ -133,7 +213,7 @@ def parse_rules(raw_text: str) -> List[Rule]:
         if rule_id is None:
             rule_id = f"R{len(rules) + 1:03d}"
         rule = Rule(rule_id=rule_id, text=text)
-        rule.keywords = extract_keywords(rule.text)
+        annotate_rule(rule)
         rules.append(rule)
 
     for line in lines:
@@ -148,13 +228,13 @@ def parse_rules(raw_text: str) -> List[Rule]:
             current_chunks.append(line)
     commit_rule(current_id, current_chunks)
 
-    if not rules and raw_text.strip():
-        for idx, chunk in enumerate(re.split(r"\n{2,}", raw_text.strip()), start=1):
+    if not rules and stripped:
+        for idx, chunk in enumerate(re.split(r"\n{2,}", stripped), start=1):
             text = chunk.strip()
             if not text:
                 continue
             rule = Rule(rule_id=f"R{idx:03d}", text=text)
-            rule.keywords = extract_keywords(rule.text)
+            annotate_rule(rule)
             rules.append(rule)
 
     return rules
@@ -186,6 +266,104 @@ def extract_keywords(text: str) -> List[str]:
             continue
         keywords.append(cleaned)
     return sorted(set(keywords))
+
+
+TAG_KEYWORDS: Dict[str, Sequence[str]] = {
+    "performance": ["业绩", "收益率", "回报", "年化", "收益", "涨幅", "超额收益"],
+    "ranking": ["排名", "名列", "前列", "位居", "第一", "冠军", "唯一"],
+    "awards": ["奖项", "获奖", "荣获"],
+    "risk_disclosure": ["风险", "提示", "不预示", "不作为", "投资建议", "保证", "承诺"],
+    "etf": ["etf", "交易型开放式", "etf基金"],
+    "index": ["指数", "中证", "沪深", "深证", "国证", "指数基金"],
+    "dividend": ["分红", "红利", "派息", "收益分配"],
+    "fund_manager": ["基金经理", "投研", "投资年限", "管理经验"],
+    "fees": ["费率", "费用", "赎回费", "管理费", "销售服务费"],
+    "sales_listing": ["发售", "发行", "募集", "上市", "上市日期", "发售日期"],
+    "guarantee": ["保本", "本金", "保证收益", "承诺收益", "收益保证"],
+    "superlative": ["最大", "最强", "最高", "唯一", "第一", "领先", "顶级"],
+    "bond": ["债券", "短债", "中债"],
+}
+
+TAG_DESCRIPTIONS: Dict[str, str] = {
+    "performance": "业绩/收益率/回报",
+    "ranking": "排名/前列/第一",
+    "awards": "奖项/获奖",
+    "risk_disclosure": "风险提示/免责声明",
+    "etf": "ETF相关",
+    "index": "指数/指数基金",
+    "dividend": "分红/收益分配",
+    "fund_manager": "基金经理/投研年限",
+    "fees": "费率/费用/赎回费",
+    "sales_listing": "发售/上市/募集",
+    "guarantee": "保本/收益保证/承诺",
+    "superlative": "最高级/唯一/领先",
+    "bond": "债券/短债",
+}
+
+TAG_ALIASES: Dict[str, str] = {
+    "业绩": "performance",
+    "收益": "performance",
+    "收益率": "performance",
+    "排名": "ranking",
+    "奖项": "awards",
+    "获奖": "awards",
+    "风险": "risk_disclosure",
+    "风险提示": "risk_disclosure",
+    "etf": "etf",
+    "指数": "index",
+    "分红": "dividend",
+    "费用": "fees",
+    "费率": "fees",
+    "基金经理": "fund_manager",
+    "发售": "sales_listing",
+    "上市": "sales_listing",
+    "募集": "sales_listing",
+    "保本": "guarantee",
+    "收益保证": "guarantee",
+    "最高级": "superlative",
+    "债券": "bond",
+}
+
+
+def normalize_tags(tags: Iterable[str]) -> List[str]:
+    allowed = set(TAG_KEYWORDS.keys())
+    normalized: List[str] = []
+    for tag in tags:
+        if tag is None:
+            continue
+        cleaned = normalize_text(str(tag))
+        if not cleaned:
+            continue
+        cleaned = cleaned.split("=", 1)[0].strip()
+        cleaned = re.sub(r"[()（）].*", "", cleaned).strip()
+        cleaned = cleaned.replace(" ", "_")
+        cleaned = TAG_ALIASES.get(cleaned, cleaned)
+        if cleaned in allowed:
+            normalized.append(cleaned)
+    return sorted(set(normalized))
+
+
+def derive_tags(text: str) -> List[str]:
+    normalized = normalize_text(text)
+    tags: List[str] = []
+    for tag, keywords in TAG_KEYWORDS.items():
+        for keyword in keywords:
+            if normalize_text(keyword) in normalized:
+                tags.append(tag)
+                break
+    return sorted(set(tags))
+
+
+def annotate_rule(rule: Rule) -> Rule:
+    if not rule.keywords:
+        rule.keywords = extract_keywords(rule.text)
+    metadata_text = " ".join(rule.metadata.values()) if rule.metadata else ""
+    derived = derive_tags(f"{rule.text} {metadata_text}".strip())
+    if rule.tags:
+        rule.tags = normalize_tags(rule.tags) or derived
+    else:
+        rule.tags = derived
+    return rule
 
 
 def format_rules(rules: Sequence[Rule]) -> str:
@@ -395,12 +573,20 @@ class RuleIndex:
         with open(self.cache_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
 
-    def search(self, query: str, top_k: int = 8) -> List[Tuple[Rule, float]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 8,
+        allowed_ids: Optional[Iterable[str]] = None,
+    ) -> List[Tuple[Rule, float]]:
         if not self.embeddings:
             self.build()
         query_embedding = self.embedder.embed_texts([query])[0]
+        allowed = set(allowed_ids) if allowed_ids else None
         scored: List[Tuple[Rule, float]] = []
         for rule, vector in zip(self.rules, self.embeddings):
+            if allowed is not None and rule.rule_id not in allowed:
+                continue
             score = cosine_similarity(query_embedding, vector)
             scored.append((rule, score))
         scored.sort(key=lambda item: item[1], reverse=True)
@@ -424,13 +610,139 @@ def hybrid_recall(
     query: str,
     keyword_top_k: int = 20,
     vector_top_k: int = 8,
+    allowed_ids: Optional[Iterable[str]] = None,
 ) -> List[Rule]:
     keyword_hits = keyword_recall(rules, query)[:keyword_top_k]
-    vector_hits = [rule for rule, _ in rule_index.search(query, top_k=vector_top_k)]
+    vector_hits = [
+        rule for rule, _ in rule_index.search(query, top_k=vector_top_k, allowed_ids=allowed_ids)
+    ]
     merged: Dict[str, Rule] = {rule.rule_id: rule for rule in keyword_hits}
     for rule in vector_hits:
         merged.setdefault(rule.rule_id, rule)
     return list(merged.values())
+
+
+def compact_text(text: str, max_chars: int = 800) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    return cleaned[:max_chars]
+
+
+def normalize_queries(queries: Iterable[str], max_chars: int = 800) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for query in queries:
+        cleaned = compact_text(str(query), max_chars=max_chars)
+        if len(cleaned) < 2:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+    return normalized
+
+
+def base_query_variants(text_query: str) -> List[str]:
+    queries: List[str] = []
+    compacted = compact_text(text_query, max_chars=800)
+    if compacted:
+        queries.append(compacted)
+    keywords = extract_keywords(compacted)
+    if keywords:
+        queries.append(" ".join(keywords[:24]))
+    return normalize_queries(queries)
+
+
+def filter_rules_by_tags(rules: Sequence[Rule], tags: Sequence[str]) -> List[Rule]:
+    normalized_tags = set(normalize_tags(tags))
+    if not normalized_tags:
+        return list(rules)
+    filtered = [rule for rule in rules if normalized_tags & set(rule.tags)]
+    return filtered or list(rules)
+
+
+def build_retrieval_plan(
+    text_query: str,
+    client: Optional[OpenAI],
+    model: str,
+    extra_headers: Optional[Dict[str, str]],
+    max_queries: int = 4,
+) -> RetrievalPlan:
+    fallback_queries = base_query_variants(text_query)
+    fallback_tags = derive_tags(text_query)
+    fallback = RetrievalPlan(queries=fallback_queries, tags=fallback_tags)
+    if client is None:
+        return fallback
+    tag_hints = "; ".join(f"{tag}={desc}" for tag, desc in TAG_DESCRIPTIONS.items())
+    system_prompt = "你是合规规则检索规划器。输出JSON必须符合指定schema。"
+    user_prompt = (
+        "请根据OCR文本生成用于检索合规规则的查询和标签。\n"
+        f"OCR text:\n{compact_text(text_query, max_chars=1200)}\n\n"
+        f"可用标签: {tag_hints}\n\n"
+        f"任务:\n- 生成1-{max_queries}条检索查询(queries)，优先覆盖潜在违规点。\n"
+        "- 选择相关标签(tags)，只能从可用标签中选择。\n"
+    )
+    try:
+        plan = call_openai_json(
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_data_url=None,
+            response_model=RetrievalPlan,
+            extra_headers=extra_headers,
+        )
+    except Exception:
+        return fallback
+    plan.queries = normalize_queries(plan.queries or [])[:max_queries] or fallback.queries
+    plan.tags = normalize_tags(plan.tags or []) or fallback.tags
+    return plan
+
+
+def rag_recall(
+    rules: Sequence[Rule],
+    rule_index: Optional[RuleIndex],
+    query: str,
+    keyword_top_k: int = 20,
+    vector_top_k: int = 8,
+) -> List[Rule]:
+    if not query or rule_index is None:
+        return list(rules)
+    return hybrid_recall(
+        rules=rules,
+        rule_index=rule_index,
+        query=query,
+        keyword_top_k=keyword_top_k,
+        vector_top_k=vector_top_k,
+    )
+
+
+def advanced_recall(
+    rules: Sequence[Rule],
+    rule_index: Optional[RuleIndex],
+    query: str,
+    client: Optional[OpenAI],
+    model: str,
+    extra_headers: Optional[Dict[str, str]],
+    keyword_top_k: int = 20,
+    vector_top_k: int = 8,
+) -> List[Rule]:
+    if not query or rule_index is None:
+        return list(rules)
+    plan = build_retrieval_plan(query, client, model, extra_headers)
+    candidate_rules = filter_rules_by_tags(rules, plan.tags)
+    allowed_ids = {rule.rule_id for rule in candidate_rules}
+    merged: Dict[str, Rule] = {}
+    for query_variant in plan.queries:
+        for rule in hybrid_recall(
+            rules=candidate_rules,
+            rule_index=rule_index,
+            query=query_variant,
+            keyword_top_k=keyword_top_k,
+            vector_top_k=vector_top_k,
+            allowed_ids=allowed_ids,
+        ):
+            merged.setdefault(rule.rule_id, rule)
+    return list(merged.values()) or candidate_rules
 
 
 def build_openai_client(api_key: Optional[str] = None, base_url: Optional[str] = None) -> OpenAI:
@@ -699,28 +1011,35 @@ def run_audit(
     client: Optional[OpenAI],
     model: str,
     extra_headers: Optional[Dict[str, str]],
-    strategy: Literal["rule_only", "llm_only", "rule_vlm"],
-    use_rag: bool,
+    strategy: Literal["baseline", "rag", "advanced_rag"],
     rule_index: Optional[RuleIndex],
     query_hint: Optional[str] = None,
 ) -> AuditResult:
-    text_query = " ".join([ocr_text or "", query_hint or ""]).strip()
-    if use_rag and rule_index:
-        candidate_rules = hybrid_recall(rules, rule_index, text_query)
-    else:
-        candidate_rules = list(rules)
-
-    if strategy == "rule_only":
-        return audit_rule_only(poster_name, ocr_text, candidate_rules)
-
+    text_query = compact_text(" ".join([ocr_text or "", query_hint or ""]).strip(), max_chars=1200)
     if client is None:
         raise RuntimeError("OpenAI client is required for LLM strategies.")
-
-    include_rules = strategy == "rule_vlm"
+    if strategy == "baseline":
+        candidate_rules = list(rules)
+    elif strategy == "rag":
+        candidate_rules = rag_recall(
+            rules=rules,
+            rule_index=rule_index,
+            query=text_query,
+        )
+    else:
+        candidate_rules = advanced_recall(
+            rules=rules,
+            rule_index=rule_index,
+            query=text_query,
+            client=client,
+            model=model,
+            extra_headers=extra_headers,
+        )
+    include_rules = True
     result = audit_with_llm(
         poster_name=poster_name,
         ocr_text=ocr_text,
-        rules=candidate_rules if include_rules else [],
+        rules=candidate_rules,
         client=client,
         model=model,
         extra_headers=extra_headers,
@@ -728,9 +1047,7 @@ def run_audit(
         image_mime=image_mime,
         include_rules=include_rules,
     )
-    if not include_rules:
-        result = fill_rule_references(result, rules, rule_index)
-    return result
+    return fill_rule_references(result, rules, rule_index)
 
 
 def compliance_rows_from_audit_results(

@@ -3,8 +3,8 @@
 Multimodal audit helper for fund marketing posters. The app supports:
 
 - Uploading posters (PNG/JPG) and OCR text files
-- Rule-based and LLM-based compliance checks
-- Hybrid rule recall (keyword + vector) via a RAG toggle
+- LLM-based compliance checks with baseline/rag/advanced rag strategies
+- Hybrid rule recall (keyword + vector) with metadata filtering + multi-query planning
 - Structured JSON outputs using Pydantic schemas
 - Batch gallery browsing with confidence bars and audit tables
 
@@ -27,7 +27,7 @@ export OPENAI_EXTRA_HEADERS='{"X-Custom-Header": "value"}'
 
 ## Notes
 
-- If you only want to run the rule-only baseline, you can skip API keys.
+- All strategies require API keys (baseline still calls the LLM).
 - For batch audit, upload OCR text files with the same stem name as the image.
 - Ground truth can use `poster_name`/`rule_id` or the Chinese headers listed below.
 
