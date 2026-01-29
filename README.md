@@ -4,7 +4,8 @@ Multimodal audit helper for fund marketing posters. The app supports:
 
 - Uploading posters (PNG/JPG) and OCR text files
 - LLM-based compliance checks with baseline/rag/advanced rag strategies
-- Hybrid rule recall (keyword + vector) with metadata filtering + multi-query planning
+- Tagger-based metadata filtering with multi-query hard matching
+- Optional VLM image description to capture visual risk cues
 - Structured JSON outputs using Pydantic schemas
 - Batch gallery browsing with confidence bars and audit tables
 
@@ -21,7 +22,6 @@ streamlit run app.py
 export OPENAI_API_KEY="your-key"
 export OPENAI_BASE_URL="https://api.openai.com/v1"  # optional
 export OPENAI_VLM_MODEL="gpt-4o-mini"
-export OPENAI_EMBEDDING_MODEL="text-embedding-3-small"
 export OPENAI_EXTRA_HEADERS='{"X-Custom-Header": "value"}'
 ```
 
@@ -30,6 +30,25 @@ export OPENAI_EXTRA_HEADERS='{"X-Custom-Header": "value"}'
 - All strategies require API keys (baseline still calls the LLM).
 - For batch audit, upload OCR text files with the same stem name as the image.
 - Ground truth can use `poster_name`/`rule_id` or the Chinese headers listed below.
+
+## Rule format (JSON)
+
+The app accepts `.json` rules in the following format:
+
+```json
+{
+  "id": "R001",
+  "category": ["货币型基金", "通用"],
+  "text": "不得承诺保本保收益",
+  "trigger_keywords": ["保本", "稳赚", "无风险"]
+}
+```
+
+## Convert TXT rules to JSON
+
+```bash
+python convert_rules.py --input "审核规则库/rules.txt" --output "审核规则库/rules_structured.json"
+```
 
 ## Evaluation / test plan
 
