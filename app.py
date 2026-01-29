@@ -88,7 +88,11 @@ def render_confidence_bars(results: Dict[str, AuditResult]) -> None:
     st.markdown("**Poster confidence bars**")
     for name, result in results.items():
         st.caption(name)
-        score = int(result.overall_confidence * 100)
+        if result is None:
+            st.markdown("**0%**")
+            continue
+        confidence = result.overall_confidence or 0.0
+        score = int(max(0.0, min(1.0, confidence)) * 100)
         bar_col, value_col = st.columns([6, 1])
         with bar_col:
             st.progress(score)
