@@ -203,21 +203,26 @@ if "audit_results" in st.session_state and image_files:
 
     render_gallery(image_files, selected_name)
 
+    result = results.get(selected_name)
     left_col, right_col = st.columns([1.35, 1])
     with left_col:
         st.subheader("Poster preview")
         selected_file = next(file for file in image_files if file.name == selected_name)
         st.image(selected_file.getvalue(), caption=selected_name, use_column_width=True)
-        if selected_name in results:
+        if result is not None:
             st.caption("Overall confidence")
-            st.progress(int(results[selected_name].overall_confidence * 100))
+            confidence = result.overall_confidence or 0.0
+            score = int(max(0.0, min(1.0, confidence)) * 100)
+            st.progress(score)
+        else:
+            st.caption("Overall confidence")
+            st.progress(0)
 
     with right_col:
         st.subheader("OCR text")
         ocr_text = ocr_map.get(Path(selected_name).stem, "")
         st.text_area("OCR output", value=ocr_text, height=240, key=f"ocr_{selected_name}")
 
-        result = results.get(selected_name)
         if result is not None:
             st.subheader("Image description")
             st.text_area(
